@@ -63,6 +63,17 @@ async fn main() -> Result<(), anyhow::Error> {
 
             tokio::spawn(bybit::run_collection(topics, args.symbols, writer_tx))
         }
+        "bitcom" => {
+            let channels = vec![
+                "order_book.1.100",
+                "trade",
+            ]
+            .iter()
+            .map(|topic| topic.to_string())
+            .collect();
+
+            tokio::spawn(bitcom::run_collection(topics, args.symbols, writer_tx))
+        }
         exchange => {
             return Err(anyhow!("{exchange} is not supported."));
         }
