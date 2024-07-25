@@ -7,6 +7,7 @@ use crate::file::Writer;
 
 mod binancefutures;
 mod bybit;
+mod bitcom;
 mod error;
 mod file;
 
@@ -64,7 +65,7 @@ async fn main() -> Result<(), anyhow::Error> {
             tokio::spawn(bybit::run_collection(topics, args.symbols, writer_tx))
         }
         "bitcom" => {
-            let channels = vec![
+            let topics = vec![
                 "order_book.1.100",
                 "trade",
             ]

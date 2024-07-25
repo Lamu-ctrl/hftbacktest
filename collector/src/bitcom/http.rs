@@ -7,54 +7,19 @@ use std::{
 use anyhow::Error;
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
-use reqwest;
-use serde_json;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::{
+    select,
+    sync::mpsc::{unbounded_channel, UnboundedSender},
+};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{client::IntoClientRequest, Message},
 };
 use tracing::{error, warn};
 
-pub async fn fetch_symbol_list() -> Result<Vec<String>, reqwest::Error> {
-    Ok(reqwest::Client::new()
-        .get("https://fapi.binance.com/fapi/v1/exchangeInfo")
-        .header("Accept", "application/json")
-        .send()
-        .await?
-        .json::<serde_json::Value>()
-        .await?
-        .get("symbols")
-        .unwrap()
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|j_symbol| j_symbol.get("contractType").unwrap().as_str().unwrap() == "PERPETUAL")
-        .map(|j_symbol| {
-            j_symbol
-                .get("symbol")
-                .unwrap()
-                .as_str()
-                .unwrap()
-                .to_string()
-        })
-        .collect())
-}
-
-pub async fn fetch_depth_snapshot(symbol: &str) -> Result<String, reqwest::Error> {
-    Ok(reqwest::Client::new()
-        .get(format!(
-            "https://fapi.binance.com/fapi/v1/depth?symbol={symbol}&limit=1000"
-        ))
-        .header("Accept", "application/json")
-        .send()
-        .await?
-        .text()
-        .await?)
-}
-
 pub async fn connect(
     url: &str,
+    topics: Vec<String>,
     ws_tx: UnboundedSender<(DateTime<Utc>, String)>,
 ) -> Result<(), anyhow::Error> {
     let request = url.into_client_request()?;
@@ -62,16 +27,39 @@ pub async fn connect(
     let (mut write, mut read) = ws_stream.split();
     let (tx, mut rx) = unbounded_channel::<()>();
 
+    write
+        .send(Message::Text(format!(
+            r#"{{"req_id": "subscribe", "op": "subscribe", "args": [{}]}}"#,
+            topics
+                .iter()
+                .map(|s| format!("\"{s}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        )))
+        .await?;
+
     tokio::spawn(async move {
+        let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
         loop {
-            match rx.recv().await {
-                Some(_) => {
-                    if let Err(_) = write.send(Message::Pong(Vec::new())).await {
-                        return;
+            select! {
+                result = rx.recv() => {
+                    match result {
+                        Some(_) => {
+                            if let Err(_) = write.send(Message::Pong(Vec::new())).await {
+                                return;
+                            }
+                        }
+                        None => {
+                            break;
+                        }
                     }
                 }
-                None => {
-                    break;
+                _ = ping_interval.tick() => {
+                    if let Err(_) = write.send(
+                        Message::Text(r#"{"req_id": "ping", "op": "ping"}"#.to_string())
+                    ).await {
+                        return;
+                    }
                 }
             }
         }
@@ -110,31 +98,42 @@ pub async fn connect(
 }
 
 pub async fn keep_connection(
-    streams: Vec<String>,
+    topics: Vec<String>,
     symbol_list: Vec<String>,
     ws_tx: UnboundedSender<(DateTime<Utc>, String)>,
 ) {
     let mut error_count = 0;
     loop {
         let connect_time = Instant::now();
-        let streams_str = symbol_list
+        let topics_ = symbol_list
             .iter()
             .map(|pair| {
-                streams
+                topics
                     .iter()
                     .cloned()
                     .map(|stream| {
                         stream
-                            .replace("$symbol", pair.to_lowercase().as_str())
+                            .replace("$symbol", pair.to_uppercase().as_str())
                             .to_string()
                     })
                     .collect::<Vec<_>>()
             })
             .flatten()
-            .collect::<Vec<_>>()
-            .join("/");
+            .collect::<Vec<_>>();
+
+        let pairs_ = symbol_list
+            .iter()
+            .map(|s| {
+                let upper = s.to_uppercase();
+                format!("{}", &upper)
+            })
+            .collect::<Vec<_>>();
+        let pairs_str = format!("[\"{}\"]", pairs_.join("\",\""));
+        println!("{}", pairs_str);
+
         if let Err(error) = connect(
-            &format!("wss://fstream.binance.com/stream?streams={streams_str}"),
+            "wss://stream.bybit.com/v5/public/linear",
+            topics_,
             ws_tx.clone(),
         )
         .await
