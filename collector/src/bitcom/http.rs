@@ -20,6 +20,7 @@ use tracing::{error, warn};
 pub async fn connect(
     url: &str,
     topics: Vec<String>,
+    pairs_str: String,
     ws_tx: UnboundedSender<(DateTime<Utc>, String)>,
 ) -> Result<(), anyhow::Error> {
     let request = url.into_client_request()?;
@@ -27,9 +28,20 @@ pub async fn connect(
     let (mut write, mut read) = ws_stream.split();
     let (tx, mut rx) = unbounded_channel::<()>();
 
+    println!("{}", format!(
+        r#"{{"type": "subscribe", "pairs": {}, "channels": [{}],"interval": "raw"}}"#,
+        pairs_str,
+        topics
+            .iter()
+            .map(|s| format!("\"{s}\""))
+            .collect::<Vec<_>>()
+            .join(",")
+    ));
+
     write
         .send(Message::Text(format!(
-            r#"{{"req_id": "subscribe", "op": "subscribe", "args": [{}]}}"#,
+            r#"{{"type": "subscribe", "pairs": {}, "channels": [{}],"interval": "raw"}}"#,
+            pairs_str,
             topics
                 .iter()
                 .map(|s| format!("\"{s}\""))
@@ -56,7 +68,7 @@ pub async fn connect(
                 }
                 _ = ping_interval.tick() => {
                     if let Err(_) = write.send(
-                        Message::Text(r#"{"req_id": "ping", "op": "ping"}"#.to_string())
+                        Message::Text(r#"{"type": "ping", "params":{"id":"toriii"}}"#.to_string())
                     ).await {
                         return;
                     }
@@ -132,8 +144,9 @@ pub async fn keep_connection(
         println!("{}", pairs_str);
 
         if let Err(error) = connect(
-            "wss://stream.bybit.com/v5/public/linear",
+            "wss://spot-ws.bit.com",
             topics_,
+            pairs_str,
             ws_tx.clone(),
         )
         .await

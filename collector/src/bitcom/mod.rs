@@ -13,6 +13,7 @@ fn handle(
     data: String,
 ) -> Result<(), ConnectorError> {
     let j: serde_json::Value = serde_json::from_str(&data)?;
+    println!("j: {:?}", j);
     if let Some(j_topic) = j.get("topic") {
         let topic = j_topic.as_str().ok_or(ConnectorError::FormatError)?;
         let symbol = topic.split(".").last().ok_or(ConnectorError::FormatError)?;

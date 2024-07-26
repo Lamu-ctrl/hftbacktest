@@ -66,7 +66,7 @@ async fn main() -> Result<(), anyhow::Error> {
         }
         "bitcom" => {
             let topics = vec![
-                "order_book.1.100",
+                "depth",
                 "trade",
             ]
             .iter()
