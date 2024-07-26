@@ -29,7 +29,7 @@ pub async fn connect(
     let (tx, mut rx) = unbounded_channel::<()>();
 
     println!("{}", format!(
-        r#"{{"type": "subscribe", "pairs": {}, "channels": [{}],"interval": "raw"}}"#,
+        r#"{{"type": "subscribe", "instruments": {}, "channels": [{}],"interval": "raw"}}"#,
         pairs_str,
         topics
             .iter()
@@ -40,7 +40,7 @@ pub async fn connect(
 
     write
         .send(Message::Text(format!(
-            r#"{{"type": "subscribe", "pairs": {}, "channels": [{}],"interval": "raw"}}"#,
+            r#"{{"type": "subscribe", "instruments": {}, "channels": [{}],"interval": "raw"}}"#,
             pairs_str,
             topics
                 .iter()
@@ -68,7 +68,7 @@ pub async fn connect(
                 }
                 _ = ping_interval.tick() => {
                     if let Err(_) = write.send(
-                        Message::Text(r#"{"type": "ping", "params":{"id":"toriii"}}"#.to_string())
+                        Message::Text(r#"{"type": "ping", "params":{"id":111}}"#.to_string())
                     ).await {
                         return;
                     }
@@ -144,7 +144,7 @@ pub async fn keep_connection(
         println!("{}", pairs_str);
 
         if let Err(error) = connect(
-            "wss://spot-ws.bit.com",
+            "wss://ws.bit.com",
             topics_,
             pairs_str,
             ws_tx.clone(),

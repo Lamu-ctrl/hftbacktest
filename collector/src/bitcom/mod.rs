@@ -14,17 +14,24 @@ fn handle(
 ) -> Result<(), ConnectorError> {
     let j: serde_json::Value = serde_json::from_str(&data)?;
     println!("j: {:?}", j);
-    if let Some(j_topic) = j.get("topic") {
+    if let Some(j_topic) = j.get("channel") {
         let topic = j_topic.as_str().ok_or(ConnectorError::FormatError)?;
-        let symbol = topic.split(".").last().ok_or(ConnectorError::FormatError)?;
-        let _ = writer_tx.send((recv_time, symbol.to_string(), data));
-    } else if let Some(j_success) = j.get("success") {
-        let success = j_success.as_bool().ok_or(ConnectorError::FormatError)?;
-        if !success {
-            error!(%data, "couldn't subscribe the topics.");
-            return Err(ConnectorError::ConnectionAbort);
+        if let Some(data_) = j.get("data") {
+            if let Some(pair) = data_.get("instrument_id") {
+                let symbol = pair.as_str().unwrap();
+                let _ = writer_tx.send((recv_time, symbol.to_string(), data));
+            }
         }
     }
+    // // 先忽略訂閱成功所傳訊息
+    // // https://www.bit.com/docs/zh-cn/spot.html#token
+    // else if let Some(j_success) = j.get("success") {
+    //     let success = j_success.as_bool().ok_or(ConnectorError::FormatError)?;
+    //     if !success {
+    //         error!(%data, "couldn't subscribe the topics.");
+    //         return Err(ConnectorError::ConnectionAbort);
+    //     }
+    // }
     Ok(())
 }
 

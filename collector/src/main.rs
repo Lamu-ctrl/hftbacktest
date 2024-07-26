@@ -66,8 +66,8 @@ async fn main() -> Result<(), anyhow::Error> {
         }
         "bitcom" => {
             let topics = vec![
-                "depth",
                 "trade",
+                // "depth",
             ]
             .iter()
             .map(|topic| topic.to_string())
