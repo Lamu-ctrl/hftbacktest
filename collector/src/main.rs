@@ -8,6 +8,7 @@ use crate::file::Writer;
 mod binancefutures;
 mod bybit;
 mod bitcom;
+mod max;
 mod error;
 mod file;
 
@@ -75,6 +76,17 @@ async fn main() -> Result<(), anyhow::Error> {
 
             tokio::spawn(bitcom::run_collection(topics, args.symbols, writer_tx))
         }
+        "max" => {
+            let topics = vec![
+                "book",
+                "trade",
+            ]
+            .iter()
+            .map(|topic| topic.to_string())
+            .collect();
+
+            tokio::spawn(max::run_collection(topics, args.symbols, writer_tx))
+        }        
         exchange => {
             return Err(anyhow!("{exchange} is not supported."));
         }
