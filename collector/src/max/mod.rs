@@ -13,11 +13,21 @@ fn handle(
     data: String,
 ) -> Result<(), ConnectorError> {
     let j: serde_json::Value = serde_json::from_str(&data)?;
-    if let Some(j_topic) = j.get("topic") {
+    if let Some(j_topic) = j.get("c") {
         let topic = j_topic.as_str().ok_or(ConnectorError::FormatError)?;
-        let symbol = topic.split(".").last().ok_or(ConnectorError::FormatError)?;
-        let _ = writer_tx.send((recv_time, symbol.to_string(), data));
+        if let Some(pair) = j.get("M") {
+            let symbol = pair.as_str().unwrap();
+            let _ = writer_tx.send((recv_time, symbol.to_string(), data));
+        }
     } else if let Some(j_success) = j.get("success") {
+        // { 
+        //     "action": "unsub",
+        //     "subscription": [
+        //       {"channel": "book", "market": "btctwd", "depth": 1},
+        //       {"channel": "trade", "market": "btctwd" }
+        //     ]
+        //     "id": "client1"
+        //   }
         let success = j_success.as_bool().ok_or(ConnectorError::FormatError)?;
         if !success {
             error!(%data, "couldn't subscribe the topics.");

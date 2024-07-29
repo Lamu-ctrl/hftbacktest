@@ -19,22 +19,30 @@ use tracing::{error, warn};
 
 pub async fn connect(
     url: &str,
-    topics: Vec<String>,
+    topics_str: String,
     ws_tx: UnboundedSender<(DateTime<Utc>, String)>,
 ) -> Result<(), anyhow::Error> {
     let request = url.into_client_request()?;
     let (ws_stream, _) = connect_async(request).await?;
     let (mut write, mut read) = ws_stream.split();
     let (tx, mut rx) = unbounded_channel::<()>();
-
+    // https://maicoin.github.io/max-websocket-docs/#/public_channels?id=subscribe
+    // {
+    //     "action": "sub",
+    //     "subscriptions": [
+    //       {"channel": "book", "market": "btctwd", "depth": 1},
+    //       {"channel": "trade", "market": "btctwd"}
+    //     ],
+    //     "id": "client1"
+    //   }
+    println!("{}",format!(
+        r#"{{"action": "sub",  "subscriptions": [{}] , "id": "toriii"}}"#,
+        topics_str
+    ));
     write
         .send(Message::Text(format!(
-            r#"{{"req_id": "subscribe", "op": "subscribe", "args": [{}]}}"#,
-            topics
-                .iter()
-                .map(|s| format!("\"{s}\""))
-                .collect::<Vec<_>>()
-                .join(",")
+            r#"{{"action": "sub",  "subscriptions": [{}] , "id": "toriii"}}"#,
+            topics_str
         )))
         .await?;
 
@@ -106,22 +114,21 @@ pub async fn keep_connection(
     loop {
         let connect_time = Instant::now();
         let topics_ = symbol_list
-            .iter()
-            .map(|pair| {
-                topics
-                    .iter()
-                    .cloned()
-                    .map(|stream| {
-                        stream
-                            .replace("$symbol", pair.to_uppercase().as_str())
-                            .to_string()
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .flatten()
-            .collect::<Vec<_>>();
+        .iter()
+        .map(|pair| {
+            topics
+                .iter()
+                .map(|topic| {
+                    format!("{{\"channel\": \"{}\", \"market\": \"{}\"}}", topic, pair)
+                })
+                .collect::<Vec<_>>()
+        })
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(",");
+
         if let Err(error) = connect(
-            "wss://stream.bybit.com/v5/public/linear",
+            "wss://max-stream.maicoin.com/ws",
             topics_,
             ws_tx.clone(),
         )
