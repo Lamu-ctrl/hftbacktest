@@ -51,7 +51,7 @@ pub async fn connect(
         .await?;
 
     tokio::spawn(async move {
-        let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
+        let mut ping_interval = tokio::time::interval(Duration::from_secs(10));
         loop {
             select! {
                 result = rx.recv() => {
@@ -86,7 +86,9 @@ pub async fn connect(
                 }
             }
             Some(Ok(Message::Binary(_))) => {}
-            Some(Ok(Message::Ping(_))) => {
+            Some(Ok(Message::Ping(ping_payload))) => {
+                // print the ping message
+                // println!("Received Ping: {:?}", ping_payload);
                 tx.send(()).unwrap();
             }
             Some(Ok(Message::Pong(_))) => {}
