@@ -7,6 +7,7 @@ use crate::file::Writer;
 
 mod binancefutures;
 mod bybit;
+mod bitcom;
 mod error;
 mod file;
 
@@ -62,6 +63,17 @@ async fn main() -> Result<(), anyhow::Error> {
             .collect();
 
             tokio::spawn(bybit::run_collection(topics, args.symbols, writer_tx))
+        }
+        "bitcom" => {
+            let topics = vec![
+                "trade",
+                "depth",
+            ]
+            .iter()
+            .map(|topic| topic.to_string())
+            .collect();
+
+            tokio::spawn(bitcom::run_collection(topics, args.symbols, writer_tx))
         }
         exchange => {
             return Err(anyhow!("{exchange} is not supported."));
