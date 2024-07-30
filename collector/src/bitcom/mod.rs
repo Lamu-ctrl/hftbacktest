@@ -13,7 +13,7 @@ fn handle(
     data: String,
 ) -> Result<(), ConnectorError> {
     let j: serde_json::Value = serde_json::from_str(&data)?;
-    println!("j: {:?}", j);
+    // println!("j: {:?}", j);
     if let Some(j_topic) = j.get("channel") {
         let topic = j_topic.as_str().ok_or(ConnectorError::FormatError)?;
         if let Some(data_) = j.get("data") {
