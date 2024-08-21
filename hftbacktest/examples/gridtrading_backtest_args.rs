@@ -3,8 +3,14 @@ use clap::Parser;
 use hftbacktest::{
     backtest::{
         assettype::LinearAsset,
-        models::{IntpOrderLatency, PowerProbQueueFunc3, ProbQueueModel},
-        reader::read_npz,
+        data::read_npz_file,
+        models::{
+            CommonFees,
+            IntpOrderLatency,
+            PowerProbQueueFunc3,
+            ProbQueueModel,
+            TradingValueFeeModel,
+        },
         recorder::BacktestRecorder,
         AssetBuilder,
         Backtest,
@@ -72,7 +78,7 @@ fn prepare_backtest(
     let queue_model = ProbQueueModel::new(PowerProbQueueFunc3::new(3.0));
 
     let hbt = Backtest::builder()
-        .add(
+        .add_asset(
             AssetBuilder::new()
                 .data(
                     data_files
@@ -82,13 +88,12 @@ fn prepare_backtest(
                 )
                 .latency_model(latency_model)
                 .asset_type(asset_type)
-                .maker_fee(maker_fee)
-                .taker_fee(taker_fee)
+                .fee_model(TradingValueFeeModel::new(CommonFees::new(-0.00005, 0.0007)))
                 .queue_model(queue_model)
                 .depth(move || {
                     let mut depth = HashMapMarketDepth::new(tick_size, lot_size);
                     if let Some(file) = initial_snapshot.as_ref() {
-                        depth.apply_snapshot(&read_npz(file).unwrap());
+                        depth.apply_snapshot(&read_npz_file(file, "data").unwrap());
                     }
                     depth
                 })

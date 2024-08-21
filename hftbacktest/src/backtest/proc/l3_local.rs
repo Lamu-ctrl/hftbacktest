@@ -6,10 +6,10 @@ use std::{
 use crate::{
     backtest::{
         assettype::AssetType,
-        models::LatencyModel,
+        data::{Data, Reader},
+        models::{FeeModel, LatencyModel},
         order::OrderBus,
-        proc::proc::{LocalProcessor, Processor},
-        reader::{Data, Reader},
+        proc::{LocalProcessor, Processor},
         state::State,
         BacktestError,
     },
@@ -23,26 +23,25 @@ use crate::{
         StateValues,
         Status,
         TimeInForce,
-        WaitOrderResponse,
-        BUY,
         LOCAL_ASK_ADD_ORDER_EVENT,
         LOCAL_ASK_DEPTH_CLEAR_EVENT,
         LOCAL_BID_ADD_ORDER_EVENT,
         LOCAL_BID_DEPTH_CLEAR_EVENT,
         LOCAL_CANCEL_ORDER_EVENT,
+        LOCAL_DEPTH_CLEAR_EVENT,
         LOCAL_EVENT,
-        LOCAL_FILL_EVENT,
         LOCAL_MODIFY_ORDER_EVENT,
-        SELL,
+        LOCAL_TRADE_EVENT,
     },
 };
 
 /// The Level3 Market-By-Order local model.
-pub struct L3Local<AT, LM, MD>
+pub struct L3Local<AT, LM, MD, FM>
 where
     AT: AssetType,
     LM: LatencyModel,
     MD: L3MarketDepth,
+    FM: FeeModel,
 {
     reader: Reader<Event>,
     data: Data<Event>,
@@ -51,24 +50,25 @@ where
     orders_to: OrderBus,
     orders_from: OrderBus,
     depth: MD,
-    state: State<AT>,
+    state: State<AT, FM>,
     order_latency: LM,
     trades: Vec<Event>,
     last_feed_latency: Option<(i64, i64)>,
     last_order_latency: Option<(i64, i64, i64)>,
 }
 
-impl<AT, LM, MD> L3Local<AT, LM, MD>
+impl<AT, LM, MD, FM> L3Local<AT, LM, MD, FM>
 where
     AT: AssetType,
     LM: LatencyModel,
     MD: L3MarketDepth,
+    FM: FeeModel,
 {
     /// Constructs an instance of `L3Local`.
     pub fn new(
         reader: Reader<Event>,
         depth: MD,
-        state: State<AT>,
+        state: State<AT, FM>,
         order_latency: LM,
         trade_len: usize,
         orders_to: OrderBus,
@@ -97,21 +97,36 @@ where
         // Applies the received order response to the local orders.
         match self.orders.entry(order.order_id) {
             Entry::Occupied(mut entry) => {
-                *entry.get_mut() = order;
+                let local_order = entry.get_mut();
+                if order.req == Status::Rejected {
+                    if order.local_timestamp == local_order.local_timestamp {
+                        if local_order.req == Status::New {
+                            local_order.req = Status::None;
+                            local_order.status = Status::Expired;
+                        } else {
+                            local_order.req = Status::None;
+                        }
+                    }
+                } else {
+                    local_order.update(&order);
+                }
             }
             Entry::Vacant(entry) => {
-                entry.insert(order);
+                if order.req != Status::Rejected {
+                    entry.insert(order);
+                }
             }
         }
         Ok(())
     }
 }
 
-impl<AT, LM, MD> LocalProcessor<MD, Event> for L3Local<AT, LM, MD>
+impl<AT, LM, MD, FM> LocalProcessor<MD, Event> for L3Local<AT, LM, MD, FM>
 where
     AT: AssetType,
     LM: LatencyModel,
     MD: L3MarketDepth,
+    FM: FeeModel,
     BacktestError: From<<MD as L3MarketDepth>::Error>,
 {
     fn submit_order(
@@ -148,6 +163,7 @@ where
         // notification.
         if order_entry_latency < 0 {
             // Rejects the order.
+            order.req = Status::Rejected;
             let rej_recv_timestamp = current_timestamp - order_entry_latency;
             self.orders_from.append(order, rej_recv_timestamp);
         } else {
@@ -168,15 +184,16 @@ where
         }
 
         order.req = Status::Canceled;
-        order.local_timestamp = current_timestamp;
         let order_entry_latency = self.order_latency.entry(current_timestamp, order);
         // Negative latency indicates that the order is rejected for technical reasons, and its
         // value represents the latency that the local experiences when receiving the rejection
         // notification.
         if order_entry_latency < 0 {
             // Rejects the order.
+            let mut order_ = order.clone();
+            order_.req = Status::Rejected;
             let rej_recv_timestamp = current_timestamp - order_entry_latency;
-            self.orders_from.append(order.clone(), rej_recv_timestamp);
+            self.orders_from.append(order_, rej_recv_timestamp);
         } else {
             let exch_recv_timestamp = current_timestamp + order_entry_latency;
             self.orders_to.append(order.clone(), exch_recv_timestamp);
@@ -208,7 +225,7 @@ where
         &self.orders
     }
 
-    fn trade(&self) -> &[Event] {
+    fn last_trades(&self) -> &[Event] {
         self.trades.as_slice()
     }
 
@@ -225,15 +242,16 @@ where
     }
 }
 
-impl<AT, LM, MD> Processor for L3Local<AT, LM, MD>
+impl<AT, LM, MD, FM> Processor for L3Local<AT, LM, MD, FM>
 where
     AT: AssetType,
     LM: LatencyModel,
     MD: L3MarketDepth,
+    FM: FeeModel,
     BacktestError: From<<MD as L3MarketDepth>::Error>,
 {
     fn initialize_data(&mut self) -> Result<i64, BacktestError> {
-        self.data = self.reader.next()?;
+        self.data = self.reader.next_data()?;
         for rn in 0..self.data.len() {
             if self.data[rn].is(LOCAL_EVENT) {
                 self.row_num = rn;
@@ -248,9 +266,11 @@ where
         let ev = &self.data[self.row_num];
         // Processes a depth event
         if ev.is(LOCAL_BID_DEPTH_CLEAR_EVENT) {
-            self.depth.clear_depth(BUY);
+            self.depth.clear_orders(Side::Buy);
         } else if ev.is(LOCAL_ASK_DEPTH_CLEAR_EVENT) {
-            self.depth.clear_depth(SELL);
+            self.depth.clear_orders(Side::Sell);
+        } else if ev.is(LOCAL_DEPTH_CLEAR_EVENT) {
+            self.depth.clear_orders(Side::None);
         } else if ev.is(LOCAL_BID_ADD_ORDER_EVENT) {
             self.depth
                 .add_buy_order(ev.order_id, ev.px, ev.qty, ev.local_ts)?;
@@ -262,17 +282,10 @@ where
                 .modify_order(ev.order_id, ev.px, ev.qty, ev.local_ts)?;
         } else if ev.is(LOCAL_CANCEL_ORDER_EVENT) {
             self.depth.delete_order(ev.order_id, ev.local_ts)?;
-        } else if ev.is(LOCAL_FILL_EVENT) {
-            // todo: based on Databento's data, CME sends a separate cancel message for filled
-            //       orders, so the fill event doesn't need to remove the order. However, it needs
-            //       to be checked if the same applies to other exchanges.
-            // self.depth.delete_order(ev.order_id, ev.local_ts)?;
         }
         // Processes a trade event
-        else if ev.is(LOCAL_FILL_EVENT) {
-            if self.trades.capacity() > 0 {
-                self.trades.push(ev.clone());
-            }
+        else if ev.is(LOCAL_TRADE_EVENT) && self.trades.capacity() > 0 {
+            self.trades.push(ev.clone());
         }
 
         // Stores the current feed latency
@@ -289,7 +302,7 @@ where
         }
 
         if next_ts <= 0 {
-            let next_data = self.reader.next()?;
+            let next_data = self.reader.next_data()?;
             let next_row = &next_data[0];
             next_ts = next_row.local_ts;
             let data = mem::replace(&mut self.data, next_data);
@@ -307,13 +320,18 @@ where
     ) -> Result<bool, BacktestError> {
         // Processes the order part.
         let mut wait_resp_order_received = false;
-        while self.orders_from.len() > 0 {
+        while !self.orders_from.is_empty() {
             let recv_timestamp = self.orders_from.earliest_timestamp().unwrap();
             if timestamp == recv_timestamp {
                 let (order, _) = self.orders_from.pop_front().unwrap();
 
-                self.last_order_latency =
-                    Some((order.local_timestamp, order.exch_timestamp, recv_timestamp));
+                // Updates the order latency only if it has a valid exchange timestamp. When the
+                // order is rejected before it reaches the matching engine, it has no exchange
+                // timestamp. This situation occurs in crypto exchanges.
+                if order.exch_timestamp > 0 {
+                    self.last_order_latency =
+                        Some((order.local_timestamp, order.exch_timestamp, recv_timestamp));
+                }
 
                 if let Some(wait_resp_order_id) = wait_resp_order_id {
                     if order.order_id == wait_resp_order_id {

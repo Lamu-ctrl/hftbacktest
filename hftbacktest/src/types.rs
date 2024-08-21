@@ -2,56 +2,132 @@ use std::{
     any::Any,
     collections::HashMap,
     fmt::{Debug, Formatter},
-    sync::Arc,
 };
 
+use anyhow::Error;
+use bincode::{
+    de::{BorrowDecoder, Decoder},
+    enc::Encoder,
+    error::{DecodeError, EncodeError},
+    BorrowDecode,
+    Decode,
+    Encode,
+};
 use dyn_clone::DynClone;
+use hftbacktest_derive::NpyDTyped;
 use thiserror::Error;
 
-use crate::{
-    backtest::reader::{NpyFile, POD},
-    depth::MarketDepth,
-};
+use crate::{backtest::data::POD, depth::MarketDepth};
+
+#[derive(Clone, Debug, Decode, Encode)]
+pub enum Value {
+    String(String),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    List(Vec<Value>),
+    Map(HashMap<String, Value>),
+    Empty,
+}
+
+impl Value {
+    pub fn get_str(&self) -> Option<&str> {
+        if let Value::String(val) = self {
+            Some(val.as_str())
+        } else {
+            None
+        }
+    }
+
+    pub fn get_int(&self) -> Option<i64> {
+        if let Value::Int(val) = self {
+            Some(*val)
+        } else {
+            None
+        }
+    }
+
+    pub fn get_float(&self) -> Option<f64> {
+        if let Value::Float(val) = self {
+            Some(*val)
+        } else {
+            None
+        }
+    }
+
+    pub fn get_bool(&self) -> Option<bool> {
+        if let Value::Bool(val) = self {
+            Some(*val)
+        } else {
+            None
+        }
+    }
+
+    pub fn get_list(&self) -> Option<&Vec<Value>> {
+        if let Value::List(val) = self {
+            Some(val)
+        } else {
+            None
+        }
+    }
+
+    pub fn get_map(&self) -> Option<&HashMap<String, Value>> {
+        if let Value::Map(val) = self {
+            Some(val)
+        } else {
+            None
+        }
+    }
+}
+
+impl From<anyhow::Error> for Value {
+    fn from(value: Error) -> Self {
+        // todo!: improve this to deliver detailed error information.
+        Value::String(value.to_string())
+    }
+}
+
+#[cfg(feature = "use_reqwest")]
+impl From<reqwest::Error> for Value {
+    fn from(value: reqwest::Error) -> Self {
+        let mut map = HashMap::new();
+        if let Some(code) = value.status() {
+            map.insert("status_code".to_string(), Value::String(code.to_string()));
+        }
+        map.insert("msg".to_string(), Value::String(value.to_string()));
+        Value::Map(map)
+    }
+}
 
 /// Error conveyed through [`LiveEvent`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Decode, Encode)]
 pub struct LiveError {
     pub kind: ErrorKind,
-    pub value: Option<Arc<Box<dyn Any + Send + Sync>>>,
+    pub value: Value,
 }
 
 impl LiveError {
     /// Constructs an instance of `LiveError`.
     pub fn new(kind: ErrorKind) -> LiveError {
-        Self { kind, value: None }
-    }
-
-    /// Constructs an instance of `LiveError` with a value that is either the original error or
-    /// contains detailed error information.
-    pub fn with<T>(kind: ErrorKind, value: T) -> LiveError
-    where
-        T: Send + Sync + 'static,
-    {
         Self {
             kind,
-            value: Some(Arc::new(Box::new(value))),
+            value: Value::Empty,
         }
     }
 
-    /// Returns some reference to the value if it exists and is of type `T`, or `None` if it isn’t.
-    pub fn value_downcast_ref<T>(&self) -> Option<&T>
-    where
-        T: 'static,
-    {
-        self.value
-            .as_ref()
-            .map(|value| value.downcast_ref())
-            .flatten()
+    /// Constructs an instance of `LiveError` with a value that contains detailed error information.
+    pub fn with(kind: ErrorKind, value: Value) -> LiveError {
+        Self { kind, value }
+    }
+
+    /// Returns a reference to the value that contains detailed error information.
+    pub fn value(&self) -> &Value {
+        &self.value
     }
 }
 
 /// Error type assigned to [`LiveError`].
-#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+#[derive(Clone, Copy, Eq, PartialEq, Debug, Decode, Encode)]
 pub enum ErrorKind {
     ConnectionInterrupted,
     CriticalConnectionError,
@@ -60,7 +136,7 @@ pub enum ErrorKind {
 }
 
 /// Events occurring in a live bot sent by a [`Connector`](`crate::connector::Connector`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Decode, Encode)]
 pub enum LiveEvent {
     FeedBatch { asset_no: usize, events: Vec<Event> },
     Feed { asset_no: usize, event: Event },
@@ -72,148 +148,154 @@ pub enum LiveEvent {
 /// Indicates a buy, with specific meaning that can vary depending on the situation. For example,
 /// when combined with a depth event, it means a bid-side event, while when combined with a trade
 /// event, it means that the trade initiator is a buyer.
-pub const BUY: i64 = 1 << 29;
+pub const BUY_EVENT: u64 = 1 << 29;
 
 /// Indicates a sell, with specific meaning that can vary depending on the situation. For example,
 /// when combined with a depth event, it means an ask-side event, while when combined with a trade
 /// event, it means that the trade initiator is a seller.
-pub const SELL: i64 = 1 << 28;
+pub const SELL_EVENT: u64 = 1 << 28;
 
 /// Indicates that the market depth is changed.
-pub const DEPTH_EVENT: i64 = 1;
+pub const DEPTH_EVENT: u64 = 1;
 
 /// Indicates that a trade occurs in the market.
-pub const TRADE_EVENT: i64 = 2;
+pub const TRADE_EVENT: u64 = 2;
 
 /// Indicates that the market depth is cleared.
-pub const DEPTH_CLEAR_EVENT: i64 = 3;
+pub const DEPTH_CLEAR_EVENT: u64 = 3;
 
 /// Indicates that the market depth snapshot is received.
-pub const DEPTH_SNAPSHOT_EVENT: i64 = 4;
+pub const DEPTH_SNAPSHOT_EVENT: u64 = 4;
 
 /// Indicates that the best bid and best ask update event is received.
-pub const DEPTH_BBO_EVENT: i64 = 5;
+pub const DEPTH_BBO_EVENT: u64 = 5;
 
 /// Indicates that an order has been added to the order book.
-pub const ADD_ORDER_EVENT: i64 = 10;
+pub const ADD_ORDER_EVENT: u64 = 10;
 
 /// Indicates that an order in the order book has been canceled.
-pub const CANCEL_ORDER_EVENT: i64 = 11;
+pub const CANCEL_ORDER_EVENT: u64 = 11;
 
 /// Indicates that an order in the order book has been modified.
-pub const MODIFY_ORDER_EVENT: i64 = 12;
+pub const MODIFY_ORDER_EVENT: u64 = 12;
 
 /// Indicates that an order in the order book has been filled.
-pub const FILL_EVENT: i64 = 13;
+pub const FILL_EVENT: u64 = 13;
 
 /// Indicates that it is a valid event to be handled by the exchange processor at the exchange
 /// timestamp.
-pub const EXCH_EVENT: i64 = 1 << 31;
+pub const EXCH_EVENT: u64 = 1 << 31;
 
 /// Indicates that it is a valid event to be handled by the local processor at the local timestamp.
-pub const LOCAL_EVENT: i64 = 1 << 30;
+pub const LOCAL_EVENT: u64 = 1 << 30;
 
-/// Represents a combination of a [`DEPTH_EVENT`], [`BUY`], and [`LOCAL_EVENT`].
-pub const LOCAL_BID_DEPTH_EVENT: i64 = DEPTH_EVENT | BUY | LOCAL_EVENT;
+/// Represents a combination of [`DEPTH_CLEAR_EVENT`], and [`LOCAL_EVENT`].
+pub const LOCAL_DEPTH_CLEAR_EVENT: u64 = DEPTH_CLEAR_EVENT | LOCAL_EVENT;
 
-/// Represents a combination of [`DEPTH_EVENT`], [`SELL`], and [`LOCAL_EVENT`].
-pub const LOCAL_ASK_DEPTH_EVENT: i64 = DEPTH_EVENT | SELL | LOCAL_EVENT;
+/// Represents a combination of [`DEPTH_CLEAR_EVENT`], and [`EXCH_EVENT`].
+pub const EXCH_DEPTH_CLEAR_EVENT: u64 = DEPTH_CLEAR_EVENT | EXCH_EVENT;
 
-/// Represents a combination of [`DEPTH_CLEAR_EVENT`], [`BUY`], and [`LOCAL_EVENT`].
-pub const LOCAL_BID_DEPTH_CLEAR_EVENT: i64 = DEPTH_CLEAR_EVENT | BUY | LOCAL_EVENT;
+/// Represents a combination of a [`DEPTH_EVENT`], [`BUY_EVENT`], and [`LOCAL_EVENT`].
+pub const LOCAL_BID_DEPTH_EVENT: u64 = DEPTH_EVENT | BUY_EVENT | LOCAL_EVENT;
 
-/// Represents a combination of [`DEPTH_CLEAR_EVENT`], [`SELL`], and [`LOCAL_EVENT`].
-pub const LOCAL_ASK_DEPTH_CLEAR_EVENT: i64 = DEPTH_CLEAR_EVENT | SELL | LOCAL_EVENT;
+/// Represents a combination of [`DEPTH_EVENT`], [`SELL_EVENT`], and [`LOCAL_EVENT`].
+pub const LOCAL_ASK_DEPTH_EVENT: u64 = DEPTH_EVENT | SELL_EVENT | LOCAL_EVENT;
 
-/// Represents a combination of [`DEPTH_SNAPSHOT_EVENT`], [`BUY`], and [`LOCAL_EVENT`].
-pub const LOCAL_BID_DEPTH_SNAPSHOT_EVENT: i64 = DEPTH_SNAPSHOT_EVENT | BUY | LOCAL_EVENT;
+/// Represents a combination of [`DEPTH_CLEAR_EVENT`], [`BUY_EVENT`], and [`LOCAL_EVENT`].
+pub const LOCAL_BID_DEPTH_CLEAR_EVENT: u64 = DEPTH_CLEAR_EVENT | BUY_EVENT | LOCAL_EVENT;
 
-/// Represents a combination of [`DEPTH_SNAPSHOT_EVENT`], [`SELL`], and [`LOCAL_EVENT`].
-pub const LOCAL_ASK_DEPTH_SNAPSHOT_EVENT: i64 = DEPTH_SNAPSHOT_EVENT | SELL | LOCAL_EVENT;
+/// Represents a combination of [`DEPTH_CLEAR_EVENT`], [`SELL_EVENT`], and [`LOCAL_EVENT`].
+pub const LOCAL_ASK_DEPTH_CLEAR_EVENT: u64 = DEPTH_CLEAR_EVENT | SELL_EVENT | LOCAL_EVENT;
 
-/// Represents a combination of [`DEPTH_BBO_EVENT`], [`BUY`], and [`LOCAL_EVENT`].
-pub const LOCAL_BID_DEPTH_BBO_EVENT: i64 = DEPTH_BBO_EVENT | BUY | LOCAL_EVENT;
+/// Represents a combination of [`DEPTH_SNAPSHOT_EVENT`], [`BUY_EVENT`], and [`LOCAL_EVENT`].
+pub const LOCAL_BID_DEPTH_SNAPSHOT_EVENT: u64 = DEPTH_SNAPSHOT_EVENT | BUY_EVENT | LOCAL_EVENT;
 
-/// Represents a combination of [`DEPTH_BBO_EVENT`], [`SELL`], and [`LOCAL_EVENT`].
-pub const LOCAL_ASK_DEPTH_BBO_EVENT: i64 = DEPTH_BBO_EVENT | SELL | LOCAL_EVENT;
+/// Represents a combination of [`DEPTH_SNAPSHOT_EVENT`], [`SELL_EVENT`], and [`LOCAL_EVENT`].
+pub const LOCAL_ASK_DEPTH_SNAPSHOT_EVENT: u64 = DEPTH_SNAPSHOT_EVENT | SELL_EVENT | LOCAL_EVENT;
+
+/// Represents a combination of [`DEPTH_BBO_EVENT`], [`BUY_EVENT`], and [`LOCAL_EVENT`].
+pub const LOCAL_BID_DEPTH_BBO_EVENT: u64 = DEPTH_BBO_EVENT | BUY_EVENT | LOCAL_EVENT;
+
+/// Represents a combination of [`DEPTH_BBO_EVENT`], [`SELL_EVENT`], and [`LOCAL_EVENT`].
+pub const LOCAL_ASK_DEPTH_BBO_EVENT: u64 = DEPTH_BBO_EVENT | SELL_EVENT | LOCAL_EVENT;
 
 /// Represents a combination of [`TRADE_EVENT`], and [`LOCAL_EVENT`].
-pub const LOCAL_TRADE_EVENT: i64 = TRADE_EVENT | LOCAL_EVENT;
+pub const LOCAL_TRADE_EVENT: u64 = TRADE_EVENT | LOCAL_EVENT;
 
-/// Represents a combination of [`LOCAL_TRADE_EVENT`] and [`BUY`].
-pub const LOCAL_BUY_TRADE_EVENT: i64 = LOCAL_TRADE_EVENT | BUY;
+/// Represents a combination of [`LOCAL_TRADE_EVENT`] and [`BUY_EVENT`].
+pub const LOCAL_BUY_TRADE_EVENT: u64 = LOCAL_TRADE_EVENT | BUY_EVENT;
 
-/// Represents a combination of [`LOCAL_TRADE_EVENT`] and [`SELL`].
-pub const LOCAL_SELL_TRADE_EVENT: i64 = LOCAL_TRADE_EVENT | SELL;
+/// Represents a combination of [`LOCAL_TRADE_EVENT`] and [`SELL_EVENT`].
+pub const LOCAL_SELL_TRADE_EVENT: u64 = LOCAL_TRADE_EVENT | SELL_EVENT;
 
-/// Represents a combination of [`DEPTH_EVENT`], [`BUY`], and [`EXCH_EVENT`].
-pub const EXCH_BID_DEPTH_EVENT: i64 = DEPTH_EVENT | BUY | EXCH_EVENT;
+/// Represents a combination of [`DEPTH_EVENT`], [`BUY_EVENT`], and [`EXCH_EVENT`].
+pub const EXCH_BID_DEPTH_EVENT: u64 = DEPTH_EVENT | BUY_EVENT | EXCH_EVENT;
 
-/// Represents a combination of [`DEPTH_EVENT`], [`SELL`], and [`EXCH_EVENT`].
-pub const EXCH_ASK_DEPTH_EVENT: i64 = DEPTH_EVENT | SELL | EXCH_EVENT;
+/// Represents a combination of [`DEPTH_EVENT`], [`SELL_EVENT`], and [`EXCH_EVENT`].
+pub const EXCH_ASK_DEPTH_EVENT: u64 = DEPTH_EVENT | SELL_EVENT | EXCH_EVENT;
 
-/// Represents a combination of [`DEPTH_CLEAR_EVENT`], [`BUY`], and [`EXCH_EVENT`].
-pub const EXCH_BID_DEPTH_CLEAR_EVENT: i64 = DEPTH_CLEAR_EVENT | BUY | EXCH_EVENT;
+/// Represents a combination of [`DEPTH_CLEAR_EVENT`], [`BUY_EVENT`], and [`EXCH_EVENT`].
+pub const EXCH_BID_DEPTH_CLEAR_EVENT: u64 = DEPTH_CLEAR_EVENT | BUY_EVENT | EXCH_EVENT;
 
-/// Represents a combination of [`DEPTH_CLEAR_EVENT`], [`SELL`], and [`EXCH_EVENT`].
-pub const EXCH_ASK_DEPTH_CLEAR_EVENT: i64 = DEPTH_CLEAR_EVENT | SELL | EXCH_EVENT;
+/// Represents a combination of [`DEPTH_CLEAR_EVENT`], [`SELL_EVENT`], and [`EXCH_EVENT`].
+pub const EXCH_ASK_DEPTH_CLEAR_EVENT: u64 = DEPTH_CLEAR_EVENT | SELL_EVENT | EXCH_EVENT;
 
-/// Represents a combination of [`DEPTH_SNAPSHOT_EVENT`], [`BUY`], and [`EXCH_EVENT`].
-pub const EXCH_BID_DEPTH_SNAPSHOT_EVENT: i64 = DEPTH_SNAPSHOT_EVENT | BUY | EXCH_EVENT;
+/// Represents a combination of [`DEPTH_SNAPSHOT_EVENT`], [`BUY_EVENT`], and [`EXCH_EVENT`].
+pub const EXCH_BID_DEPTH_SNAPSHOT_EVENT: u64 = DEPTH_SNAPSHOT_EVENT | BUY_EVENT | EXCH_EVENT;
 
-/// Represents a combination of [`DEPTH_SNAPSHOT_EVENT`], [`SELL`], and [`EXCH_EVENT`].
-pub const EXCH_ASK_DEPTH_SNAPSHOT_EVENT: i64 = DEPTH_SNAPSHOT_EVENT | SELL | EXCH_EVENT;
+/// Represents a combination of [`DEPTH_SNAPSHOT_EVENT`], [`SELL_EVENT`], and [`EXCH_EVENT`].
+pub const EXCH_ASK_DEPTH_SNAPSHOT_EVENT: u64 = DEPTH_SNAPSHOT_EVENT | SELL_EVENT | EXCH_EVENT;
 
-/// Represents a combination of [`DEPTH_BBO_EVENT`], [`BUY`], and [`EXCH_EVENT`].
-pub const EXCH_BID_DEPTH_BBO_EVENT: i64 = DEPTH_BBO_EVENT | BUY | EXCH_EVENT;
+/// Represents a combination of [`DEPTH_BBO_EVENT`], [`BUY_EVENT`], and [`EXCH_EVENT`].
+pub const EXCH_BID_DEPTH_BBO_EVENT: u64 = DEPTH_BBO_EVENT | BUY_EVENT | EXCH_EVENT;
 
-/// Represents a combination of [`DEPTH_BBO_EVENT`], [`SELL`], and [`EXCH_EVENT`].
-pub const EXCH_ASK_DEPTH_BBO_EVENT: i64 = DEPTH_BBO_EVENT | SELL | EXCH_EVENT;
+/// Represents a combination of [`DEPTH_BBO_EVENT`], [`SELL_EVENT`], and [`EXCH_EVENT`].
+pub const EXCH_ASK_DEPTH_BBO_EVENT: u64 = DEPTH_BBO_EVENT | SELL_EVENT | EXCH_EVENT;
 
 /// Represents a combination of [`TRADE_EVENT`], and [`EXCH_EVENT`].
-pub const EXCH_TRADE_EVENT: i64 = TRADE_EVENT | EXCH_EVENT;
+pub const EXCH_TRADE_EVENT: u64 = TRADE_EVENT | EXCH_EVENT;
 
-/// Represents a combination of [`EXCH_TRADE_EVENT`] and [`BUY`].
-pub const EXCH_BUY_TRADE_EVENT: i64 = EXCH_TRADE_EVENT | BUY;
+/// Represents a combination of [`EXCH_TRADE_EVENT`] and [`BUY_EVENT`].
+pub const EXCH_BUY_TRADE_EVENT: u64 = EXCH_TRADE_EVENT | BUY_EVENT;
 
-/// Represents a combination of [`EXCH_TRADE_EVENT`] and [`SELL`].
-pub const EXCH_SELL_TRADE_EVENT: i64 = EXCH_TRADE_EVENT | SELL;
+/// Represents a combination of [`EXCH_TRADE_EVENT`] and [`SELL_EVENT`].
+pub const EXCH_SELL_TRADE_EVENT: u64 = EXCH_TRADE_EVENT | SELL_EVENT;
 
 /// Represents a combination of [`LOCAL_EVENT`] and [`ADD_ORDER_EVENT`].
-pub const LOCAL_ADD_ORDER_EVENT: i64 = LOCAL_EVENT | ADD_ORDER_EVENT;
+pub const LOCAL_ADD_ORDER_EVENT: u64 = LOCAL_EVENT | ADD_ORDER_EVENT;
 
-/// Represents a combination of [`BUY`] and [`LOCAL_ADD_ORDER_EVENT`].
-pub const LOCAL_BID_ADD_ORDER_EVENT: i64 = BUY | LOCAL_ADD_ORDER_EVENT;
+/// Represents a combination of [`BUY_EVENT`] and [`LOCAL_ADD_ORDER_EVENT`].
+pub const LOCAL_BID_ADD_ORDER_EVENT: u64 = BUY_EVENT | LOCAL_ADD_ORDER_EVENT;
 
-/// Represents a combination of [`SELL`] and [`LOCAL_ADD_ORDER_EVENT`].
-pub const LOCAL_ASK_ADD_ORDER_EVENT: i64 = SELL | LOCAL_ADD_ORDER_EVENT;
+/// Represents a combination of [`SELL_EVENT`] and [`LOCAL_ADD_ORDER_EVENT`].
+pub const LOCAL_ASK_ADD_ORDER_EVENT: u64 = SELL_EVENT | LOCAL_ADD_ORDER_EVENT;
 
 /// Represents a combination of [`LOCAL_EVENT`] and [`CANCEL_ORDER_EVENT`].
-pub const LOCAL_CANCEL_ORDER_EVENT: i64 = LOCAL_EVENT | CANCEL_ORDER_EVENT;
+pub const LOCAL_CANCEL_ORDER_EVENT: u64 = LOCAL_EVENT | CANCEL_ORDER_EVENT;
 
 /// Represents a combination of [`LOCAL_EVENT`] and [`MODIFY_ORDER_EVENT`].
-pub const LOCAL_MODIFY_ORDER_EVENT: i64 = LOCAL_EVENT | MODIFY_ORDER_EVENT;
+pub const LOCAL_MODIFY_ORDER_EVENT: u64 = LOCAL_EVENT | MODIFY_ORDER_EVENT;
 
 /// Represents a combination of [`LOCAL_EVENT`] and [`FILL_EVENT`].
-pub const LOCAL_FILL_EVENT: i64 = LOCAL_EVENT | FILL_EVENT;
+pub const LOCAL_FILL_EVENT: u64 = LOCAL_EVENT | FILL_EVENT;
 
 /// Represents a combination of [`EXCH_EVENT`] and [`ADD_ORDER_EVENT`].
-pub const EXCH_ADD_ORDER_EVENT: i64 = EXCH_EVENT | ADD_ORDER_EVENT;
+pub const EXCH_ADD_ORDER_EVENT: u64 = EXCH_EVENT | ADD_ORDER_EVENT;
 
-/// Represents a combination of [`BUY`] and [`EXCH_ADD_ORDER_EVENT`].
-pub const EXCH_BID_ADD_ORDER_EVENT: i64 = BUY | EXCH_ADD_ORDER_EVENT;
+/// Represents a combination of [`BUY_EVENT`] and [`EXCH_ADD_ORDER_EVENT`].
+pub const EXCH_BID_ADD_ORDER_EVENT: u64 = BUY_EVENT | EXCH_ADD_ORDER_EVENT;
 
-/// Represents a combination of [`SELL`] and [`EXCH_ADD_ORDER_EVENT`].
-pub const EXCH_ASK_ADD_ORDER_EVENT: i64 = SELL | EXCH_ADD_ORDER_EVENT;
+/// Represents a combination of [`SELL_EVENT`] and [`EXCH_ADD_ORDER_EVENT`].
+pub const EXCH_ASK_ADD_ORDER_EVENT: u64 = SELL_EVENT | EXCH_ADD_ORDER_EVENT;
 
 /// Represents a combination of [`EXCH_EVENT`] and [`CANCEL_ORDER_EVENT`].
-pub const EXCH_CANCEL_ORDER_EVENT: i64 = EXCH_EVENT | CANCEL_ORDER_EVENT;
+pub const EXCH_CANCEL_ORDER_EVENT: u64 = EXCH_EVENT | CANCEL_ORDER_EVENT;
 
 /// Represents a combination of [`EXCH_EVENT`] and [`MODIFY_ORDER_EVENT`].
-pub const EXCH_MODIFY_ORDER_EVENT: i64 = EXCH_EVENT | MODIFY_ORDER_EVENT;
+pub const EXCH_MODIFY_ORDER_EVENT: u64 = EXCH_EVENT | MODIFY_ORDER_EVENT;
 
 /// Represents a combination of [`EXCH_EVENT`] and [`FILL_EVENT`].
-pub const EXCH_FILL_EVENT: i64 = EXCH_EVENT | FILL_EVENT;
+pub const EXCH_FILL_EVENT: u64 = EXCH_EVENT | FILL_EVENT;
 
 /// Indicates that one should continue until the end of the data.
 pub const UNTIL_END_OF_DATA: i64 = i64::MAX;
@@ -224,24 +306,24 @@ pub type OrderId = u64;
 pub enum WaitOrderResponse {
     None,
     Any,
-    Specified(usize, OrderId),
+    Specified { asset_no: usize, order_id: OrderId },
 }
 
-/// Exchange Level3 Market-By-Order event data.
-#[derive(Clone, PartialEq, Debug)]
+/// Feed event data.
 #[repr(C, align(64))]
+#[derive(Clone, PartialEq, Debug, NpyDTyped, Decode, Encode)]
 pub struct Event {
     /// Event flag
-    pub ev: i64,
+    pub ev: u64,
     /// Exchange timestamp, which is the time at which the event occurs on the exchange.
     pub exch_ts: i64,
-    /// Exchange timestamp, which is the time at which the event occurs on the local.
+    /// Local timestamp, which is the time at which the event is received by the local.
     pub local_ts: i64,
     /// Price
     pub px: f64,
     /// Quantity
     pub qty: f64,
-    /// Order Id
+    /// Order ID is only for the L3 Market-By-Order feed.
     pub order_id: u64,
     /// Reserved for an additional i64 value
     pub ival: i64,
@@ -251,12 +333,10 @@ pub struct Event {
 
 unsafe impl POD for Event {}
 
-unsafe impl NpyFile for Event {}
-
 impl Event {
-    /// Checks if this `L3Event` corresponds to the given event.
+    /// Checks if this `Event` corresponds to the given event.
     #[inline(always)]
-    pub fn is(&self, event: i64) -> bool {
+    pub fn is(&self, event: u64) -> bool {
         if (self.ev & event) != event {
             false
         } else {
@@ -272,7 +352,7 @@ impl Event {
 
 /// Represents a side, which can refer to either the side of an order or the initiator's side in a
 /// trade event, with the meaning varying depending on the context.
-#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+#[derive(Clone, Copy, Eq, PartialEq, Debug, Decode, Encode)]
 #[repr(i8)]
 pub enum Side {
     /// In the market depth event, this indicates the bid side; in the market trade event, it
@@ -281,6 +361,8 @@ pub enum Side {
     /// In the market depth event, this indicates the ask side; in the market trade event, it
     /// indicates that the trade initiator is a seller.
     Sell = -1,
+    /// No side provided.
+    None = 0,
     /// This occurs when the [`Connector`](`crate::connector::Connector`) receives a side value that
     /// does not have a corresponding enum value.
     Unsupported = 127,
@@ -291,6 +373,7 @@ impl AsRef<f64> for Side {
         match self {
             Side::Buy => &1.0f64,
             Side::Sell => &-1.0f64,
+            Side::None => panic!("Side::None"),
             Side::Unsupported => panic!("Side::Unsupported"),
         }
     }
@@ -301,13 +384,14 @@ impl AsRef<str> for Side {
         match self {
             Side::Buy => "BUY",
             Side::Sell => "SELL",
+            Side::None => panic!("Side::None"),
             Side::Unsupported => panic!("Side::Unsupported"),
         }
     }
 }
 
 /// Order status
-#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+#[derive(Clone, Copy, Eq, PartialEq, Debug, Decode, Encode)]
 #[repr(u8)]
 pub enum Status {
     None = 0,
@@ -316,13 +400,14 @@ pub enum Status {
     Filled = 3,
     Canceled = 4,
     PartiallyFilled = 5,
+    Rejected = 6,
     /// This occurs when the [`Connector`](`crate::connector::Connector`) receives an order status
     /// value that does not have a corresponding enum value.
     Unsupported = 255,
 }
 
 /// Time In Force
-#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+#[derive(Clone, Copy, Eq, PartialEq, Debug, Decode, Encode)]
 #[repr(u8)]
 pub enum TimeInForce {
     /// Good 'Til Canceled
@@ -351,7 +436,7 @@ impl AsRef<str> for TimeInForce {
 }
 
 /// Order type
-#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+#[derive(Clone, Copy, Eq, PartialEq, Debug, Decode, Encode)]
 #[repr(u8)]
 pub enum OrdType {
     Limit = 0,
@@ -511,9 +596,9 @@ impl Order {
             self.exch_timestamp = order.exch_timestamp;
         }
         self.status = order.status;
-        if order.local_timestamp > 0 {
-            self.local_timestamp = order.local_timestamp;
-        }
+        // if order.local_timestamp > 0 {
+        //     self.local_timestamp = order.local_timestamp;
+        // }
         self.req = order.req;
         self.exec_price_tick = order.exec_price_tick;
         self.exec_qty = order.exec_qty;
@@ -543,6 +628,76 @@ impl Debug for Order {
             .field("maker", &self.maker)
             .field("order_type", &self.order_type)
             .finish()
+    }
+}
+
+impl Decode for Order {
+    fn decode<D: Decoder>(decoder: &mut D) -> Result<Self, DecodeError> {
+        Ok(Self {
+            qty: Decode::decode(decoder)?,
+            leaves_qty: Decode::decode(decoder)?,
+            exec_qty: Decode::decode(decoder)?,
+            exec_price_tick: Decode::decode(decoder)?,
+            price_tick: Decode::decode(decoder)?,
+            tick_size: Decode::decode(decoder)?,
+            exch_timestamp: Decode::decode(decoder)?,
+            local_timestamp: Decode::decode(decoder)?,
+            order_id: Decode::decode(decoder)?,
+            // In a live bot, q isn't used.
+            q: Box::new(()),
+            maker: Decode::decode(decoder)?,
+            order_type: Decode::decode(decoder)?,
+            req: Decode::decode(decoder)?,
+            status: Decode::decode(decoder)?,
+            side: Decode::decode(decoder)?,
+            time_in_force: Decode::decode(decoder)?,
+        })
+    }
+}
+
+impl<'de> BorrowDecode<'de> for Order {
+    fn borrow_decode<D: BorrowDecoder<'de>>(decoder: &mut D) -> Result<Self, DecodeError> {
+        Ok(Self {
+            qty: Decode::decode(decoder)?,
+            leaves_qty: Decode::decode(decoder)?,
+            exec_qty: Decode::decode(decoder)?,
+            exec_price_tick: Decode::decode(decoder)?,
+            price_tick: Decode::decode(decoder)?,
+            tick_size: Decode::decode(decoder)?,
+            exch_timestamp: Decode::decode(decoder)?,
+            local_timestamp: Decode::decode(decoder)?,
+            order_id: Decode::decode(decoder)?,
+            // In a live bot, q isn't used.
+            q: Box::new(()),
+            maker: Decode::decode(decoder)?,
+            order_type: Decode::decode(decoder)?,
+            req: Decode::decode(decoder)?,
+            status: Decode::decode(decoder)?,
+            side: Decode::decode(decoder)?,
+            time_in_force: Decode::decode(decoder)?,
+        })
+    }
+}
+
+impl Encode for Order {
+    fn encode<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
+        self.qty.encode(encoder)?;
+        self.leaves_qty.encode(encoder)?;
+        self.exec_qty.encode(encoder)?;
+        self.exec_price_tick.encode(encoder)?;
+        self.price_tick.encode(encoder)?;
+        self.tick_size.encode(encoder)?;
+        self.exch_timestamp.encode(encoder)?;
+        self.local_timestamp.encode(encoder)?;
+        self.order_id.encode(encoder)?;
+        // In a live bot, q isn't used.
+        self.maker.encode(encoder)?;
+        self.order_type.encode(encoder)?;
+        self.req.encode(encoder)?;
+        self.status.encode(encoder)?;
+        self.side.encode(encoder)?;
+        self.time_in_force.encode(encoder)?;
+        Ok(())
     }
 }
 
@@ -591,6 +746,7 @@ pub enum BuildError {
 }
 
 /// Used to submit an order in a live bot.
+#[derive(Decode, Encode)]
 pub struct OrderRequest {
     pub order_id: u64,
     pub price: f64,
@@ -630,7 +786,7 @@ where
     /// Returns the last market trades.
     ///
     /// * `asset_no` - Asset number from which the last market trades will be retrieved.
-    fn trade(&self, asset_no: usize) -> &[Event];
+    fn last_trades(&self, asset_no: usize) -> &[Event];
 
     /// Clears the last market trades from the buffer.
     ///
@@ -657,6 +813,7 @@ where
     ///                   the exchange model for details.
     ///
     ///  * `wait` - If true, wait until the order placement response is received.
+    #[allow(clippy::too_many_arguments)]
     fn submit_buy_order(
         &mut self,
         asset_no: usize,
@@ -682,6 +839,7 @@ where
     ///                   the exchange model for details.
     ///
     ///  * `wait` - If true, wait until the order placement response is received.
+    #[allow(clippy::too_many_arguments)]
     fn submit_sell_order(
         &mut self,
         asset_no: usize,
@@ -787,7 +945,7 @@ mod tests {
         prelude::LOCAL_EVENT,
         types::{
             Event,
-            BUY,
+            BUY_EVENT,
             LOCAL_BID_DEPTH_CLEAR_EVENT,
             LOCAL_BID_DEPTH_EVENT,
             LOCAL_BID_DEPTH_SNAPSHOT_EVENT,
@@ -813,7 +971,7 @@ mod tests {
         assert!(event.is(LOCAL_BID_DEPTH_CLEAR_EVENT));
 
         let event = Event {
-            ev: LOCAL_EVENT | BUY | 0xff,
+            ev: LOCAL_EVENT | BUY_EVENT | 0xff,
             exch_ts: 0,
             local_ts: 0,
             order_id: 0,
@@ -828,6 +986,6 @@ mod tests {
         assert!(!event.is(LOCAL_BID_DEPTH_CLEAR_EVENT));
         assert!(!event.is(LOCAL_BID_DEPTH_SNAPSHOT_EVENT));
         assert!(event.is(LOCAL_EVENT));
-        assert!(event.is(BUY));
+        assert!(event.is(BUY_EVENT));
     }
 }

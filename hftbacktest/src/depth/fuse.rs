@@ -2,9 +2,9 @@ use std::collections::{hash_map::Entry, HashMap};
 
 use super::{ApplySnapshot, L1MarketDepth, L3Order, MarketDepth, INVALID_MAX, INVALID_MIN};
 use crate::{
-    backtest::{reader::Data, BacktestError},
+    backtest::{data::Data, BacktestError},
     prelude::{L2MarketDepth, Side, DEPTH_SNAPSHOT_EVENT, EXCH_EVENT, LOCAL_EVENT},
-    types::{Event, BUY, SELL},
+    types::{Event, OrderId, BUY_EVENT, SELL_EVENT},
 };
 
 struct QtyTimestamp {
@@ -44,7 +44,7 @@ pub struct FusedHashMapMarketDepth {
     pub best_ask_timestamp: i64,
     pub low_bid_tick: i64,
     pub high_ask_tick: i64,
-    pub orders: HashMap<i64, L3Order>,
+    pub orders: HashMap<OrderId, L3Order>,
 }
 
 #[inline(always)]
@@ -54,7 +54,7 @@ fn depth_below(depth: &HashMap<i64, QtyTimestamp>, start: i64, end: i64) -> i64 
             return t;
         }
     }
-    return INVALID_MIN;
+    INVALID_MIN
 }
 
 #[inline(always)]
@@ -64,7 +64,7 @@ fn depth_above(depth: &HashMap<i64, QtyTimestamp>, start: i64, end: i64) -> i64 
             return t;
         }
     }
-    return INVALID_MAX;
+    INVALID_MAX
 }
 
 impl FusedHashMapMarketDepth {
@@ -247,9 +247,9 @@ impl L2MarketDepth for FusedHashMapMarketDepth {
         )
     }
 
-    fn clear_depth(&mut self, side: i64, clear_upto_price: f64) {
+    fn clear_depth(&mut self, side: Side, clear_upto_price: f64) {
         let clear_upto = (clear_upto_price / self.tick_size).round() as i64;
-        if side == BUY {
+        if side == Side::Buy {
             if self.best_bid_tick != INVALID_MIN {
                 for t in clear_upto..(self.best_bid_tick + 1) {
                     if self.bid_depth.contains_key(&t) {
@@ -261,7 +261,7 @@ impl L2MarketDepth for FusedHashMapMarketDepth {
             if self.best_bid_tick == INVALID_MIN {
                 self.low_bid_tick = INVALID_MAX;
             }
-        } else if side == SELL {
+        } else if side == Side::Sell {
             if self.best_ask_tick != INVALID_MAX {
                 for t in self.best_ask_tick..(clear_upto + 1) {
                     if self.ask_depth.contains_key(&t) {
@@ -340,7 +340,7 @@ impl MarketDepth for FusedHashMapMarketDepth {
     }
 }
 
-impl ApplySnapshot<Event> for FusedHashMapMarketDepth {
+impl ApplySnapshot for FusedHashMapMarketDepth {
     fn apply_snapshot(&mut self, data: &Data<Event>) {
         self.best_bid_tick = INVALID_MIN;
         self.best_ask_tick = INVALID_MAX;
@@ -354,14 +354,14 @@ impl ApplySnapshot<Event> for FusedHashMapMarketDepth {
             let timestamp = data[row_num].exch_ts;
 
             let price_tick = (price / self.tick_size).round() as i64;
-            if data[row_num].ev & BUY == BUY {
+            if data[row_num].ev & BUY_EVENT == BUY_EVENT {
                 self.best_bid_tick = self.best_bid_tick.max(price_tick);
                 self.low_bid_tick = self.low_bid_tick.min(price_tick);
                 *self
                     .bid_depth
                     .entry(price_tick)
                     .or_insert(Default::default()) = QtyTimestamp { qty, timestamp };
-            } else if data[row_num].ev & SELL == SELL {
+            } else if data[row_num].ev & SELL_EVENT == SELL_EVENT {
                 self.best_ask_tick = self.best_ask_tick.min(price_tick);
                 self.high_ask_tick = self.high_ask_tick.max(price_tick);
                 *self
@@ -378,34 +378,40 @@ impl ApplySnapshot<Event> for FusedHashMapMarketDepth {
         let mut bid_depth = self
             .bid_depth
             .iter()
-            .map(|(&px_tick, &qty)| (px_tick, qty))
+            .map(|(&px_tick, qty)| (px_tick, qty))
             .collect::<Vec<_>>();
         bid_depth.sort_by(|a, b| b.0.cmp(&a.0));
         for (px_tick, qty) in bid_depth {
             events.push(Event {
-                ev: EXCH_EVENT | LOCAL_EVENT | BUY | DEPTH_SNAPSHOT_EVENT,
+                ev: EXCH_EVENT | LOCAL_EVENT | BUY_EVENT | DEPTH_SNAPSHOT_EVENT,
                 exch_ts: qty.timestamp,
                 // todo: it's not a problem now, but it would be better to have valid timestamps.
                 local_ts: 0,
                 px: px_tick as f64 * self.tick_size,
                 qty: qty.qty,
+                order_id: 0,
+                ival: 0,
+                fval: 0.0,
             });
         }
 
         let mut ask_depth = self
             .ask_depth
             .iter()
-            .map(|(&px_tick, &qty)| (px_tick, qty))
+            .map(|(&px_tick, qty)| (px_tick, qty))
             .collect::<Vec<_>>();
         ask_depth.sort_by(|a, b| a.0.cmp(&b.0));
         for (px_tick, qty) in ask_depth {
             events.push(Event {
-                ev: EXCH_EVENT | LOCAL_EVENT | SELL | DEPTH_SNAPSHOT_EVENT,
+                ev: EXCH_EVENT | LOCAL_EVENT | SELL_EVENT | DEPTH_SNAPSHOT_EVENT,
                 exch_ts: qty.timestamp,
                 // todo: it's not a problem now, but it would be better to have valid timestamps.
                 local_ts: 0,
                 px: px_tick as f64 * self.tick_size,
                 qty: qty.qty,
+                order_id: 0,
+                ival: 0,
+                fval: 0.0,
             });
         }
 

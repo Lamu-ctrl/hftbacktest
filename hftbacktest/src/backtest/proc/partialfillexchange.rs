@@ -1,5 +1,6 @@
 use std::{
     cell::RefCell,
+    cmp::Ordering,
     collections::{HashMap, HashSet},
     mem,
     rc::Rc,
@@ -8,10 +9,10 @@ use std::{
 use crate::{
     backtest::{
         assettype::AssetType,
-        models::{LatencyModel, QueueModel},
+        data::{Data, Reader},
+        models::{FeeModel, LatencyModel, QueueModel},
         order::OrderBus,
-        proc::proc::Processor,
-        reader::{Data, Reader},
+        proc::Processor,
         state::State,
         BacktestError,
     },
@@ -23,7 +24,6 @@ use crate::{
         Side,
         Status,
         TimeInForce,
-        BUY,
         EXCH_ASK_DEPTH_CLEAR_EVENT,
         EXCH_ASK_DEPTH_EVENT,
         EXCH_ASK_DEPTH_SNAPSHOT_EVENT,
@@ -31,9 +31,9 @@ use crate::{
         EXCH_BID_DEPTH_EVENT,
         EXCH_BID_DEPTH_SNAPSHOT_EVENT,
         EXCH_BUY_TRADE_EVENT,
+        EXCH_DEPTH_CLEAR_EVENT,
         EXCH_EVENT,
         EXCH_SELL_TRADE_EVENT,
-        SELL,
     },
 };
 
@@ -76,12 +76,13 @@ use crate::{
 /// results.
 /// (more comment will be added...)
 ///
-pub struct PartialFillExchange<AT, LM, QM, MD>
+pub struct PartialFillExchange<AT, LM, QM, MD, FM>
 where
     AT: AssetType,
     LM: LatencyModel,
     QM: QueueModel<MD>,
     MD: MarketDepth,
+    FM: FeeModel,
 {
     reader: Reader<Event>,
     data: Data<Event>,
@@ -97,25 +98,26 @@ where
     orders_from: OrderBus,
 
     depth: MD,
-    state: State<AT>,
+    state: State<AT, FM>,
     order_latency: LM,
     queue_model: QM,
 
     filled_orders: Vec<OrderId>,
 }
 
-impl<AT, LM, QM, MD> PartialFillExchange<AT, LM, QM, MD>
+impl<AT, LM, QM, MD, FM> PartialFillExchange<AT, LM, QM, MD, FM>
 where
     AT: AssetType,
     LM: LatencyModel,
     QM: QueueModel<MD>,
     MD: MarketDepth,
+    FM: FeeModel,
 {
     /// Constructs an instance of `PartialFillExchange`.
     pub fn new(
         reader: Reader<Event>,
         depth: MD,
-        state: State<AT>,
+        state: State<AT, FM>,
         order_latency: LM,
         queue_model: QM,
         orders_to: OrderBus,
@@ -165,22 +167,26 @@ where
         qty: f64,
         timestamp: i64,
     ) -> Result<(), BacktestError> {
-        if order.price_tick < price_tick {
-            self.filled_orders.push(order.order_id);
-            return self.fill(order, timestamp, true, order.price_tick, order.leaves_qty);
-        } else if order.price_tick == price_tick {
-            // Updates the order's queue position.
-            self.queue_model.trade(order, qty, &self.depth);
-            let filled_qty = self.queue_model.is_filled(order, &self.depth);
-            if filled_qty > 0.0 {
-                // q_ahead is negative since is_filled is true and its value represents the
-                // executable quantity of this order after execution in the queue ahead of this
-                // order.
-                // let q_qty =
-                //     (-order.front_q_qty / self.depth.lot_size()).floor() * self.depth.lot_size();
-                let exec_qty = filled_qty.min(qty).min(order.leaves_qty);
+        match order.price_tick.cmp(&price_tick) {
+            Ordering::Greater => {}
+            Ordering::Less => {
                 self.filled_orders.push(order.order_id);
-                return self.fill(order, timestamp, true, order.price_tick, exec_qty);
+                return self.fill(order, timestamp, true, order.price_tick, order.leaves_qty);
+            }
+            Ordering::Equal => {
+                // Updates the order's queue position.
+                self.queue_model.trade(order, qty, &self.depth);
+                let filled_qty = self.queue_model.is_filled(order, &self.depth);
+                if filled_qty > 0.0 {
+                    // q_ahead is negative since is_filled is true and its value represents the
+                    // executable quantity of this order after execution in the queue ahead of this
+                    // order.
+                    // let q_qty =
+                    //     (-order.front_q_qty / self.depth.lot_size()).floor() * self.depth.lot_size();
+                    let exec_qty = filled_qty.min(qty).min(order.leaves_qty);
+                    self.filled_orders.push(order.order_id);
+                    return self.fill(order, timestamp, true, order.price_tick, exec_qty);
+                }
             }
         }
         Ok(())
@@ -193,22 +199,26 @@ where
         qty: f64,
         timestamp: i64,
     ) -> Result<(), BacktestError> {
-        if order.price_tick > price_tick {
-            self.filled_orders.push(order.order_id);
-            return self.fill(order, timestamp, true, order.price_tick, order.leaves_qty);
-        } else if order.price_tick == price_tick {
-            // Updates the order's queue position.
-            self.queue_model.trade(order, qty, &self.depth);
-            let filled_qty = self.queue_model.is_filled(order, &self.depth);
-            if filled_qty > 0.0 {
-                // q_ahead is negative since is_filled is true and its value represents the
-                // executable quantity of this order after execution in the queue ahead of this
-                // order.
-                // let q_qty =
-                //     (-order.front_q_qty / self.depth.lot_size()).floor() * self.depth.lot_size();
-                let exec_qty = filled_qty.min(qty).min(order.leaves_qty);
+        match order.price_tick.cmp(&price_tick) {
+            Ordering::Greater => {
                 self.filled_orders.push(order.order_id);
-                return self.fill(order, timestamp, true, order.price_tick, exec_qty);
+                return self.fill(order, timestamp, true, order.price_tick, order.leaves_qty);
+            }
+            Ordering::Less => {}
+            Ordering::Equal => {
+                // Updates the order's queue position.
+                self.queue_model.trade(order, qty, &self.depth);
+                let filled_qty = self.queue_model.is_filled(order, &self.depth);
+                if filled_qty > 0.0 {
+                    // q_ahead is negative since is_filled is true and its value represents the
+                    // executable quantity of this order after execution in the queue ahead of this
+                    // order.
+                    // let q_qty =
+                    //     (-order.front_q_qty / self.depth.lot_size()).floor() * self.depth.lot_size();
+                    let exec_qty = filled_qty.min(qty).min(order.leaves_qty);
+                    self.filled_orders.push(order.order_id);
+                    return self.fill(order, timestamp, true, order.price_tick, exec_qty);
+                }
             }
         }
         Ok(())
@@ -245,7 +255,7 @@ where
         }
         order.exch_timestamp = timestamp;
         let local_recv_timestamp =
-            order.exch_timestamp + self.order_latency.response(timestamp, &order);
+            order.exch_timestamp + self.order_latency.response(timestamp, order);
 
         self.state.apply_fill(order);
         self.orders_to.append(order.clone(), local_recv_timestamp);
@@ -253,7 +263,7 @@ where
     }
 
     fn remove_filled_orders(&mut self) {
-        if self.filled_orders.len() > 0 {
+        if !self.filled_orders.is_empty() {
             let mut orders = self.orders.borrow_mut();
             for order_id in self.filled_orders.drain(..) {
                 let order = orders.remove(&order_id).unwrap();
@@ -473,7 +483,7 @@ where
                 // The exchange accepts this order.
                 self.buy_orders
                     .entry(order.price_tick)
-                    .or_insert(HashSet::new())
+                    .or_default()
                     .insert(order.order_id);
 
                 order.exch_timestamp = timestamp;
@@ -585,7 +595,7 @@ where
                 // The exchange accepts this order.
                 self.sell_orders
                     .entry(order.price_tick)
-                    .or_insert(HashSet::new())
+                    .or_default()
                     .insert(order.order_id);
 
                 order.exch_timestamp = timestamp;
@@ -607,12 +617,10 @@ where
         };
 
         if exch_order.is_none() {
-            order.status = Status::Expired;
+            order.req = Status::Rejected;
             order.exch_timestamp = timestamp;
-            // let local_recv_timestamp = timestamp + self.order_latency.response(timestamp, &order);
-            // It can overwrite another existing order on the local side if order_id is the same.
-            // So, commented out.
-            // self.orders_to.append(order.copy(), local_recv_timestamp)
+            let local_recv_timestamp = timestamp + self.order_latency.response(timestamp, &order);
+            self.orders_to.append(order, local_recv_timestamp);
             return Ok(());
         }
 
@@ -647,13 +655,11 @@ where
         //
         //     // The order can be already deleted due to fill or expiration.
         //     if exch_order.is_none() {
-        //         order.status = Status::Expired;
+        //         order.req = Status::Rejected;
         //         order.exch_timestamp = timestamp;
         //         let local_recv_timestamp =
         //             timestamp + self.order_latency.response(timestamp, &order);
-        //         // It can overwrite another existing order on the local side if order_id is the
-        //         // same. So, commented out.
-        //         // self.orders_to.append(order.copy(), local_recv_timestamp)
+        //         self.orders_to.append(order, local_recv_timestamp);
         //         return Ok(local_recv_timestamp);
         //     }
         //
@@ -773,15 +779,16 @@ where
     }
 }
 
-impl<AT, LM, QM, MD> Processor for PartialFillExchange<AT, LM, QM, MD>
+impl<AT, LM, QM, MD, FM> Processor for PartialFillExchange<AT, LM, QM, MD, FM>
 where
     AT: AssetType,
     LM: LatencyModel,
     QM: QueueModel<MD>,
     MD: MarketDepth + L2MarketDepth,
+    FM: FeeModel,
 {
     fn initialize_data(&mut self) -> Result<i64, BacktestError> {
-        self.data = self.reader.next()?;
+        self.data = self.reader.next_data()?;
         for rn in 0..self.data.len() {
             if self.data[rn].is(EXCH_EVENT) {
                 self.row_num = rn;
@@ -794,9 +801,11 @@ where
     fn process_data(&mut self) -> Result<(i64, i64), BacktestError> {
         let row_num = self.row_num;
         if self.data[row_num].is(EXCH_BID_DEPTH_CLEAR_EVENT) {
-            self.depth.clear_depth(BUY, self.data[row_num].px);
+            self.depth.clear_depth(Side::Buy, self.data[row_num].px);
         } else if self.data[row_num].is(EXCH_ASK_DEPTH_CLEAR_EVENT) {
-            self.depth.clear_depth(SELL, self.data[row_num].px);
+            self.depth.clear_depth(Side::Sell, self.data[row_num].px);
+        } else if self.data[row_num].is(EXCH_DEPTH_CLEAR_EVENT) {
+            self.depth.clear_depth(Side::None, 0.0);
         } else if self.data[row_num].is(EXCH_BID_DEPTH_EVENT)
             || self.data[row_num].is(EXCH_BID_DEPTH_SNAPSHOT_EVENT)
         {
@@ -846,7 +855,7 @@ where
                     for t in (self.depth.best_bid_tick() + 1)..=price_tick {
                         if let Some(order_ids) = self.sell_orders.get(&t) {
                             for order_id in order_ids.clone().iter() {
-                                let order = orders_borrowed.get_mut(&order_id).unwrap();
+                                let order = orders_borrowed.get_mut(order_id).unwrap();
                                 self.check_if_sell_filled(
                                     order,
                                     price_tick,
@@ -882,7 +891,7 @@ where
                     for t in (price_tick..self.depth.best_ask_tick()).rev() {
                         if let Some(order_ids) = self.buy_orders.get(&t) {
                             for order_id in order_ids.clone().iter() {
-                                let order = orders_borrowed.get_mut(&order_id).unwrap();
+                                let order = orders_borrowed.get_mut(order_id).unwrap();
                                 self.check_if_buy_filled(
                                     order,
                                     price_tick,
@@ -908,7 +917,7 @@ where
         }
 
         if next_ts <= 0 {
-            let next_data = self.reader.next()?;
+            let next_data = self.reader.next_data()?;
             let next_row = &next_data[0];
             next_ts = next_row.exch_ts;
             let data = mem::replace(&mut self.data, next_data);
@@ -924,7 +933,7 @@ where
         _wait_resp_order_id: Option<OrderId>,
     ) -> Result<bool, BacktestError> {
         // Processes the order part.
-        while self.orders_from.len() > 0 {
+        while !self.orders_from.is_empty() {
             let recv_timestamp = self.orders_from.earliest_timestamp().unwrap();
             if timestamp == recv_timestamp {
                 let (order, _) = self.orders_from.pop_front().unwrap();

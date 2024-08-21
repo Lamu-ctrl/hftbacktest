@@ -335,9 +335,11 @@ orders_values_next.argtypes = [c_void_p]
 
 class Values:
     ptr: voidptr
+    order_ptr: voidptr
 
     def __init__(self, ptr: voidptr):
         self.ptr = ptr
+        self.order_ptr = 0
 
     # def __next__(self) -> Order:
     #     if is_null_ptr(self.ptr):
@@ -369,6 +371,25 @@ class Values:
             )
             return Order_(arr)
 
+    def has_next(self) -> bool:
+        if is_null_ptr(self.ptr):
+            return False
+        self.order_ptr = orders_values_next(self.ptr)
+        if is_null_ptr(self.order_ptr):
+            self.ptr = 0
+            return False
+        return True
+
+    def get(self) -> Order:
+        if is_null_ptr(self.order_ptr):
+            raise RuntimeError
+        arr = carray(
+            address_as_void_pointer(self.order_ptr),
+            1,
+            dtype=order_dtype
+        )
+        return Order_(arr)
+
 
 Values_ = jitclass(Values)
 
@@ -398,6 +419,20 @@ class OrderDict:
                 order = values.next()
                 if order is None:
                     break
+                # Do what you need with the order.
+
+        Alternatively, ``has_next`` returns ``True`` if there is a next element and ``False`` otherwise, while also
+        moving the iterator to the next element internally. ``get`` method then returns the element moved to by the
+        ``has_next`` method. Since ``has_next`` internally moves the iterator, it should not be used solely to check if
+        there is a next element.
+
+        **Example**
+
+        .. code-block:: python
+
+            values = order_dict.values()
+            while values.has_next():
+                order = values.get()
                 # Do what you need with the order.
 
         """
@@ -469,9 +504,9 @@ hashmapbt_depth = lib.hashmapbt_depth
 hashmapbt_depth.restype = c_void_p
 hashmapbt_depth.argtypes = [c_void_p, c_uint64]
 
-hashmapbt_trade = lib.hashmapbt_trade
-hashmapbt_trade.restype = c_void_p
-hashmapbt_trade.argtypes = [c_void_p, c_uint64, POINTER(c_uint64)]
+hashmapbt_last_trades = lib.hashmapbt_last_trades
+hashmapbt_last_trades.restype = c_void_p
+hashmapbt_last_trades.argtypes = [c_void_p, c_uint64, POINTER(c_uint64)]
 
 hashmapbt_num_assets = lib.hashmapbt_num_assets
 hashmapbt_num_assets.restype = c_uint64
@@ -592,7 +627,7 @@ class HashMapMarketDepthBacktest:
         )
         return StateValues_(arr)
 
-    def trade(self, asset_no: uint64) -> EVENT_ARRAY:
+    def last_trades(self, asset_no: uint64) -> EVENT_ARRAY:
         """
         Args:
             asset_no: Asset number from which the trades will be retrieved.
@@ -602,7 +637,7 @@ class HashMapMarketDepthBacktest:
         """
         length = uint64(0)
         len_ptr = ptr_from_val(length)
-        ptr = hashmapbt_trade(self.ptr, asset_no, len_ptr)
+        ptr = hashmapbt_last_trades(self.ptr, asset_no, len_ptr)
         return numba.carray(
             address_as_void_pointer(ptr),
             val_from_ptr(len_ptr),
@@ -611,11 +646,12 @@ class HashMapMarketDepthBacktest:
 
     def clear_last_trades(self, asset_no: uint64) -> None:
         """
-        Clears the last trades occurring in the market from the buffer for :func:`trade`.
+        Clears the last trades occurring in the market from the buffer for :func:`last_trades`.
 
         Args:
-            asset_no: Asset number at which this command will be executed. If :const:`ALL_ASSETS`, all last trades in
-                      any assets will be cleared.
+            asset_no: Asset number at which this command will be executed.
+                      If :const:`ALL_ASSETS <hftbacktest.types.ALL_ASSETS>`,
+                      all last trades in any assets will be cleared.
         """
         hashmapbt_clear_last_trades(self.ptr, asset_no)
 
@@ -625,7 +661,8 @@ class HashMapMarketDepthBacktest:
             asset_no: Asset number from which orders will be retrieved.
 
         Returns:
-            An order dictionary where the keys are order IDs and the corresponding values are :class:`Order`s.
+            An order dictionary where the keys are order IDs and the corresponding values are
+            :class:`Order <hftbacktest.order.Order>`.
         """
         return OrderDict_(hashmapbt_orders(self.ptr, asset_no))
 
@@ -648,21 +685,24 @@ class HashMapMarketDepthBacktest:
                       exchange sides.
             price: Order price.
             qty: Quantity to buy.
-            time_in_force: Available options vary depending on the exchange model. See to the exchange model for
-                           details.
+            time_in_force: Available options vary depending on the exchange model. See to the exchange model for details.
 
-                * :const:`GTC`
-                * :const:`GTX`
-                * :const:`FOK`
-                * :const:`IOC`
+                * :const:`GTC <hftbacktest.order.GTC>`
+                * :const:`GTX <hftbacktest.order.GTX>`
+                * :const:`FOK <hftbacktest.order.FOK>`
+                * :const:`IOC <hftbacktest.order.IOC>`
+
             order_type: Available options vary depending on the exchange model. See to the exchange model for details.
 
-                * :const:`LIMIT`
-                * :const:`MARKET`
+                * :const:`LIMIT <hftbacktest.order.LIMIT>`
+                * :const:`MARKET <hftbacktest.order.MARKET>`
+
             wait: If `True`, wait until the order placement response is received.
 
         Returns:
-            -1 when an error occurs; otherwise, it succeeds in submitting a buy order.
+            * `0` when it successfully submits an order.
+            * `1` when it reaches the end of the data, if `wait` is `True`.
+            * Otherwise, an error occurred.
         """
         return hashmapbt_submit_buy_order(self.ptr, asset_no, order_id, price, qty, time_in_force, order_type, wait)
 
@@ -684,22 +724,25 @@ class HashMapMarketDepthBacktest:
             order_id: The unique order ID; there should not be any existing order with the same ID on both local and
                       exchange sides.
             price: Order price.
-            qty: Quantity to buy.
-            time_in_force: Available options vary depending on the exchange model. See to the exchange model for
-                           details.
+            qty: Quantity to sell.
+            time_in_force: Available options vary depending on the exchange model. See to the exchange model for details.
 
-                * :const:`GTC`
-                * :const:`GTX`
-                * :const:`FOK`
-                * :const:`IOC`
+                * :const:`GTC <hftbacktest.order.GTC>`
+                * :const:`GTX <hftbacktest.order.GTX>`
+                * :const:`FOK <hftbacktest.order.FOK>`
+                * :const:`IOC <hftbacktest.order.IOC>`
+
             order_type: Available options vary depending on the exchange model. See to the exchange model for details.
 
-                * :const:`LIMIT`
-                * :const:`MARKET`
+                * :const:`LIMIT <hftbacktest.order.LIMIT>`
+                * :const:`MARKET <hftbacktest.order.MARKET>`
+
             wait: If `True`, wait until the order placement response is received.
 
         Returns:
-            `-1` when an error occurs; otherwise, it succeeds in submitting a sell order.
+            * `0` when it successfully submits an order.
+            * `1` when it reaches the end of the data, if `wait` is `True`.
+            * Otherwise, an error occurred.
         """
         return hashmapbt_submit_sell_order(self.ptr, asset_no, order_id, price, qty, time_in_force, order_type, wait)
 
@@ -713,18 +756,21 @@ class HashMapMarketDepthBacktest:
             wait: If `True`, wait until the order cancel response is received.
 
         Returns:
-            `-1` when an error occurs; otherwise, it successfully submits a cancel order.
+            * `0` when it successfully cancels an order.
+            * `1` when it reaches the end of the data, if `wait` is `True`.
+            * Otherwise, an error occurred.
         """
         return hashmapbt_cancel(self.ptr, asset_no, order_id, wait)
 
     def clear_inactive_orders(self, asset_no: uint64) -> None:
         """
-        Clears inactive orders from the local order dictionary whose status is neither :const:`NEW` nor
-        :const:`PARTIALLY_FILLED`.
+        Clears inactive orders from the local order dictionary whose status is neither
+        :const:`NEW <hftbacktest.order.NEW>` nor :const:`PARTIALLY_FILLED <hftbacktest.order.PARTIALLY_FILLED>`.
 
         Args:
-            asset_no: Asset number at which this command will be executed. If :const:`ALL_ASSETS`, all inactive orders
-                      in any assets will be cleared.
+            asset_no: Asset number at which this command will be executed.
+                      If :const:`ALL_ASSETS <hftbacktest.types.ALL_ASSETS>`,
+                      all inactive orders in any assets will be cleared.
         """
         hashmapbt_clear_inactive_orders(self.ptr, asset_no)
 
@@ -739,9 +785,10 @@ class HashMapMarketDepthBacktest:
                      be the same as the data’s timestamp unit.
 
         Returns:
-            * `1` when it receives an order response for the specified order ID of the specified asset number.
-            * `0` when it reaches the end of the data.
-            * `-1` when an error occurs.
+            * `0` when it receives an order response for the specified order ID of the specified asset number, or
+              reaches the timeout.
+            * `1` when it reaches the end of the data.
+            * Otherwise, an error occurred.
         """
         return hashmapbt_hashmapbt_wait_order_response(self.ptr, asset_no, order_id, timeout)
 
@@ -756,9 +803,9 @@ class HashMapMarketDepthBacktest:
                      However, unit should be the same as the data’s timestamp unit.
 
         Returns:
-            * `1` when it receives a feed or an order response.
-            * `0` when it reaches the end of the data.
-            * `-1` when an error occurs.
+            * `0` when it receives a feed or an order response, or reaches the timeout.
+            * `1` when it reaches the end of the data.
+            * Otherwise, an error occurred.
         """
         return hashmapbt_wait_next_feed(self.ptr, include_order_resp, timeout)
 
@@ -771,9 +818,9 @@ class HashMapMarketDepthBacktest:
                       data’s timestamp unit.
 
         Returns:
-            * `1` when it reaches the specified timestamp within the data.
-            * `0` when it reaches the end of the data.
-            * `-1` when an error occurs.
+            * `0` when it successfully elapses the given duration.
+            * `1` when it reaches the end of the data.
+            * Otherwise, an error occurred.
         """
         return hashmapbt_elapse(self.ptr, duration)
 
@@ -789,9 +836,9 @@ class HashMapMarketDepthBacktest:
                       data’s timestamp unit.
 
         Returns:
-            * `1` when it reaches the specified timestamp within the data.
-            * `0` when it reaches the end of the data.
-            * `-1` when an error occurs.
+            * `0` when it successfully elapses the given duration.
+            * `1` when it reaches the end of the data.
+            * Otherwise, an error occurred.
         """
         return hashmapbt_elapse_bt(self.ptr, duration)
 
@@ -800,7 +847,8 @@ class HashMapMarketDepthBacktest:
         Closes this backtester or bot.
 
         Returns:
-            `-1` when an error occurs; otherwise, it successfully closes the bot.
+            * `0` when it successfully closes the bot.
+            * Otherwise, an error occurred.
         """
         return hashmapbt_close(self.ptr)
 
@@ -879,9 +927,9 @@ roivecbt_depth = lib.roivecbt_depth
 roivecbt_depth.restype = c_void_p
 roivecbt_depth.argtypes = [c_void_p, c_uint64]
 
-roivecbt_trade = lib.roivecbt_trade
-roivecbt_trade.restype = c_void_p
-roivecbt_trade.argtypes = [c_void_p, c_uint64, POINTER(c_uint64)]
+roivecbt_last_trades = lib.roivecbt_last_trades
+roivecbt_last_trades.restype = c_void_p
+roivecbt_last_trades.argtypes = [c_void_p, c_uint64, POINTER(c_uint64)]
 
 roivecbt_num_assets = lib.roivecbt_num_assets
 roivecbt_num_assets.restype = c_uint64
@@ -998,7 +1046,7 @@ class ROIVectorMarketDepthBacktest:
         )
         return StateValues_(arr)
 
-    def trade(self, asset_no: uint64) -> EVENT_ARRAY:
+    def last_trades(self, asset_no: uint64) -> EVENT_ARRAY:
         """
         Args:
             asset_no: Asset number from which the trades will be retrieved.
@@ -1008,7 +1056,7 @@ class ROIVectorMarketDepthBacktest:
         """
         length = uint64(0)
         len_ptr = ptr_from_val(length)
-        ptr = roivecbt_trade(self.ptr, asset_no, len_ptr)
+        ptr = roivecbt_last_trades(self.ptr, asset_no, len_ptr)
         return numba.carray(
             address_as_void_pointer(ptr),
             val_from_ptr(len_ptr),
@@ -1017,11 +1065,12 @@ class ROIVectorMarketDepthBacktest:
 
     def clear_last_trades(self, asset_no: uint64) -> None:
         """
-        Clears the last trades occurring in the market from the buffer for :func:`trade`.
+        Clears the last trades occurring in the market from the buffer for :func:`last_trades`.
 
         Args:
-            asset_no: Asset number at which this command will be executed. If :const:`ALL_ASSETS`, all last trades in
-                      any assets will be cleared.
+            asset_no: Asset number at which this command will be executed.
+                      If :const:`ALL_ASSETS <hftbacktest.types.ALL_ASSETS>`,
+                      all last trades in any assets will be cleared.
         """
         roivecbt_clear_last_trades(self.ptr, asset_no)
 
@@ -1031,7 +1080,8 @@ class ROIVectorMarketDepthBacktest:
             asset_no: Asset number from which orders will be retrieved.
 
         Returns:
-            An order dictionary where the keys are order IDs and the corresponding values are :class:`Order`s.
+            An order dictionary where the keys are order IDs and the corresponding values are
+            :class:`Order <hftbacktest.order.Order>`.
         """
         return OrderDict_(roivecbt_orders(self.ptr, asset_no))
 
@@ -1054,21 +1104,24 @@ class ROIVectorMarketDepthBacktest:
                       exchange sides.
             price: Order price.
             qty: Quantity to buy.
-            time_in_force: Available options vary depending on the exchange model. See to the exchange model for
-                           details.
+            time_in_force: Available options vary depending on the exchange model. See to the exchange model for details.
 
-                * :const:`GTC`
-                * :const:`GTX`
-                * :const:`FOK`
-                * :const:`IOC`
+                * :const:`GTC <hftbacktest.order.GTC>`
+                * :const:`GTX <hftbacktest.order.GTX>`
+                * :const:`FOK <hftbacktest.order.FOK>`
+                * :const:`IOC <hftbacktest.order.IOC>`
+
             order_type: Available options vary depending on the exchange model. See to the exchange model for details.
 
-                * :const:`LIMIT`
-                * :const:`MARKET`
+                * :const:`LIMIT <hftbacktest.order.LIMIT>`
+                * :const:`MARKET <hftbacktest.order.MARKET>`
+
             wait: If `True`, wait until the order placement response is received.
 
         Returns:
-            -1 when an error occurs; otherwise, it succeeds in submitting a buy order.
+            * `0` when it successfully submits an order.
+            * `1` when it reaches the end of the data, if `wait` is `True`.
+            * Otherwise, an error occurred.
         """
         return roivecbt_submit_buy_order(self.ptr, asset_no, order_id, price, qty, time_in_force, order_type, wait)
 
@@ -1090,22 +1143,25 @@ class ROIVectorMarketDepthBacktest:
             order_id: The unique order ID; there should not be any existing order with the same ID on both local and
                       exchange sides.
             price: Order price.
-            qty: Quantity to buy.
-            time_in_force: Available options vary depending on the exchange model. See to the exchange model for
-                           details.
+            qty: Quantity to sell.
+            time_in_force: Available options vary depending on the exchange model. See to the exchange model for details.
 
-                * :const:`GTC`
-                * :const:`GTX`
-                * :const:`FOK`
-                * :const:`IOC`
+                * :const:`GTC <hftbacktest.order.GTC>`
+                * :const:`GTX <hftbacktest.order.GTX>`
+                * :const:`FOK <hftbacktest.order.FOK>`
+                * :const:`IOC <hftbacktest.order.IOC>`
+
             order_type: Available options vary depending on the exchange model. See to the exchange model for details.
 
-                * :const:`LIMIT`
-                * :const:`MARKET`
+                * :const:`LIMIT <hftbacktest.order.LIMIT>`
+                * :const:`MARKET <hftbacktest.order.MARKET>`
+
             wait: If `True`, wait until the order placement response is received.
 
         Returns:
-            `-1` when an error occurs; otherwise, it succeeds in submitting a sell order.
+            * `0` when it successfully submits an order.
+            * `1` when it reaches the end of the data, if `wait` is `True`.
+            * Otherwise, an error occurred.
         """
         return roivecbt_submit_sell_order(self.ptr, asset_no, order_id, price, qty, time_in_force, order_type, wait)
 
@@ -1119,18 +1175,21 @@ class ROIVectorMarketDepthBacktest:
             wait: If `True`, wait until the order cancel response is received.
 
         Returns:
-            `-1` when an error occurs; otherwise, it successfully submits a cancel order.
+            * `0` when it successfully cancels an order.
+            * `1` when it reaches the end of the data, if `wait` is `True`.
+            * Otherwise, an error occurred.
         """
         return roivecbt_cancel(self.ptr, asset_no, order_id, wait)
 
     def clear_inactive_orders(self, asset_no: uint64) -> None:
         """
-        Clears inactive orders from the local order dictionary whose status is neither :const:`NEW` nor
-        :const:`PARTIALLY_FILLED`.
+        Clears inactive orders from the local order dictionary whose status is neither
+        :const:`NEW <hftbacktest.order.NEW>` nor :const:`PARTIALLY_FILLED <hftbacktest.order.PARTIALLY_FILLED>`.
 
         Args:
-            asset_no: Asset number at which this command will be executed. If :const:`ALL_ASSETS`, all inactive orders
-                      in any assets will be cleared.
+            asset_no: Asset number at which this command will be executed.
+                      If :const:`ALL_ASSETS <hftbacktest.types.ALL_ASSETS>`,
+                      all inactive orders in any assets will be cleared.
         """
         roivecbt_clear_inactive_orders(self.ptr, asset_no)
 
@@ -1145,9 +1204,10 @@ class ROIVectorMarketDepthBacktest:
                      be the same as the data’s timestamp unit.
 
         Returns:
-            * `1` when it receives an order response for the specified order ID of the specified asset number.
-            * `0` when it reaches the end of the data.
-            * `-1` when an error occurs.
+            * `0` when it receives an order response for the specified order ID of the specified asset number, or
+              reaches the timeout.
+            * `1` when it reaches the end of the data.
+            * Otherwise, an error occurred.
         """
         return roivecbt_roivecbt_wait_order_response(self.ptr, asset_no, order_id, timeout)
 
@@ -1162,9 +1222,9 @@ class ROIVectorMarketDepthBacktest:
                      However, unit should be the same as the data’s timestamp unit.
 
         Returns:
-            * `1` when it receives a feed or an order response.
-            * `0` when it reaches the end of the data.
-            * `-1` when an error occurs.
+            * `0` when it receives a feed or an order response, or reaches the timeout.
+            * `1` when it reaches the end of the data.
+            * Otherwise, an error occurred.
         """
         return roivecbt_wait_next_feed(self.ptr, include_order_resp, timeout)
 
@@ -1177,9 +1237,9 @@ class ROIVectorMarketDepthBacktest:
                       data’s timestamp unit.
 
         Returns:
-            * `1` when it reaches the specified timestamp within the data.
-            * `0` when it reaches the end of the data.
-            * `-1` when an error occurs.
+            * `0` when it successfully elapses the given duration.
+            * `1` when it reaches the end of the data.
+            * Otherwise, an error occurred.
         """
         return roivecbt_elapse(self.ptr, duration)
 
@@ -1195,9 +1255,9 @@ class ROIVectorMarketDepthBacktest:
                       data’s timestamp unit.
 
         Returns:
-            * `1` when it reaches the specified timestamp within the data.
-            * `0` when it reaches the end of the data.
-            * `-1` when an error occurs.
+            * `0` when it successfully elapses the given duration.
+            * `1` when it reaches the end of the data.
+            * Otherwise, an error occurred.
         """
         return roivecbt_elapse_bt(self.ptr, duration)
 
@@ -1206,7 +1266,8 @@ class ROIVectorMarketDepthBacktest:
         Closes this backtester or bot.
 
         Returns:
-            `-1` when an error occurs; otherwise, it successfully closes the bot.
+            * `0` when it successfully closes the bot.
+            * Otherwise, an error occurred.
         """
         return roivecbt_close(self.ptr)
 

@@ -5,8 +5,11 @@ pub use depth::*;
 use hftbacktest::{
     backtest::{
         assettype::{InverseAsset, LinearAsset},
+        data::{read_npz_file, Cache, Data, DataPtr, Reader},
         models::{
+            CommonFees,
             ConstantLatency,
+            FlatPerTradeFeeModel,
             IntpOrderLatency,
             LogProbQueueFunc,
             LogProbQueueFunc2,
@@ -16,10 +19,11 @@ use hftbacktest::{
             PowerProbQueueFunc3,
             ProbQueueModel,
             RiskAdverseQueueModel,
+            TradingQtyFeeModel,
+            TradingValueFeeModel,
         },
         order::OrderBus,
         proc::{Local, LocalProcessor, NoPartialFillExchange, PartialFillExchange, Processor},
-        reader::{read_npz, Cache, Data, Reader},
         state::State,
         Asset,
         Backtest,
@@ -27,8 +31,8 @@ use hftbacktest::{
     },
     prelude::{ApplySnapshot, Event, HashMapMarketDepth, ROIVectorMarketDepth},
 };
+use hftbacktest_derive::build_asset;
 pub use order::*;
-use procmacro::build_asset;
 use pyo3::prelude::*;
 
 mod backtest;
@@ -68,6 +72,13 @@ pub enum ExchangeKind {
     PartialFillExchange {},
 }
 
+#[derive(Clone)]
+pub enum FeeModel {
+    TradingValueFeeModel { fees: CommonFees },
+    TradingQtyFeeModel { fees: CommonFees },
+    FlatPerTradeFeeModel { fees: CommonFees },
+}
+
 /// Builds a backtesting asset.
 #[pyclass(subclass)]
 pub struct BacktestAsset {
@@ -78,12 +89,11 @@ pub struct BacktestAsset {
     exch_kind: ExchangeKind,
     tick_size: f64,
     lot_size: f64,
-    maker_fee: f64,
-    taker_fee: f64,
-    trade_len: usize,
+    last_trades_cap: usize,
     roi_lb: f64,
     roi_ub: f64,
     initial_snapshot: Option<DataSource<Event>>,
+    fee_model: FeeModel,
 }
 
 unsafe impl Send for BacktestAsset {}
@@ -91,6 +101,7 @@ unsafe impl Send for BacktestAsset {}
 #[pymethods]
 impl BacktestAsset {
     /// Constructs an instance of `AssetBuilder`.
+    #[allow(clippy::new_without_default)]
     #[new]
     pub fn new() -> Self {
         Self {
@@ -103,13 +114,14 @@ impl BacktestAsset {
             queue_model: QueueModel::LogProbQueueModel2 {},
             tick_size: 0.0,
             lot_size: 0.0,
-            maker_fee: 0.0,
-            taker_fee: 0.0,
             exch_kind: ExchangeKind::NoPartialFillExchange {},
-            trade_len: 0,
+            last_trades_cap: 0,
             roi_lb: 0.0,
             roi_ub: 0.0,
             initial_snapshot: None,
+            fee_model: FeeModel::TradingValueFeeModel {
+                fees: CommonFees::new(0.0, 0.0),
+            },
         }
     }
 
@@ -123,11 +135,11 @@ impl BacktestAsset {
         slf
     }
 
-    /// Sets the lower bound price of the `ROIVectorMarketDepth <https://docs.rs/hftbacktest/latest/hftbacktest/depth/struct.ROIVectorMarketDepth.html>`_.
+    /// Sets the upper bound price of the `ROIVectorMarketDepth <https://docs.rs/hftbacktest/latest/hftbacktest/depth/struct.ROIVectorMarketDepth.html>`_.
     /// Only valid if `ROIVectorMarketDepthBacktest` is built.
     ///
     /// Args:
-    ///     roi_lb: the lower bound price of the range of interest.
+    ///     roi_ub: the upper bound price of the range of interest.
     pub fn roi_ub(mut slf: PyRefMut<Self>, roi_ub: f64) -> PyRefMut<Self> {
         slf.roi_ub = roi_ub;
         slf
@@ -140,7 +152,7 @@ impl BacktestAsset {
 
     pub fn _add_data_ndarray(mut slf: PyRefMut<Self>, data: usize, len: usize) -> PyRefMut<Self> {
         let arr = slice_from_raw_parts_mut(data as *mut u8, len * size_of::<Event>());
-        let data = unsafe { Data::<Event>::from_ptr(arr, 0) };
+        let data = unsafe { Data::<Event>::from_data_ptr(DataPtr::from_ptr(arr), 0) };
         slf.data.push(DataSource::Data(data));
         slf
     }
@@ -207,7 +219,7 @@ impl BacktestAsset {
         len: usize,
     ) -> PyRefMut<Self> {
         let arr = slice_from_raw_parts_mut(data as *mut u8, len * size_of::<OrderLatencyRow>());
-        let data = unsafe { Data::<OrderLatencyRow>::from_ptr(arr, 0) };
+        let data = unsafe { Data::<OrderLatencyRow>::from_data_ptr(DataPtr::from_ptr(arr), 0) };
         slf.latency_model = LatencyModel::IntpOrderLatency {
             data: vec![DataSource::Data(data)],
         };
@@ -216,6 +228,8 @@ impl BacktestAsset {
 
     /// Uses the `RiskAdverseQueueModel <https://docs.rs/hftbacktest/latest/hftbacktest/backtest/models/struct.RiskAdverseQueueModel.html>`_
     /// for the queue position model.
+    ///
+    /// * `Order Fill - RiskAdverseQueueModel <https://hftbacktest.readthedocs.io/en/latest/order_fill.html#riskaversequeuemodel>`_
     pub fn risk_adverse_queue_model(mut slf: PyRefMut<Self>) -> PyRefMut<Self> {
         slf.queue_model = QueueModel::RiskAdverseQueueModel {};
         slf
@@ -225,6 +239,7 @@ impl BacktestAsset {
     ///
     /// Please find the details below.
     ///
+    /// * `Order Fill - ProbQueueModel <https://hftbacktest.readthedocs.io/en/latest/order_fill.html#probqueuemodel>`_
     /// * `ProbQueueModel <https://docs.rs/hftbacktest/latest/hftbacktest/backtest/models/struct.ProbQueueModel.html>`_
     /// * `LogProbQueueFunc <https://docs.rs/hftbacktest/latest/hftbacktest/backtest/models/struct.LogProbQueueFunc.html>`_
     pub fn log_prob_queue_model(mut slf: PyRefMut<Self>) -> PyRefMut<Self> {
@@ -236,6 +251,7 @@ impl BacktestAsset {
     ///
     /// Please find the details below.
     ///
+    /// * `Order Fill - ProbQueueModel <https://hftbacktest.readthedocs.io/en/latest/order_fill.html#probqueuemodel>`_
     /// * `ProbQueueModel <https://docs.rs/hftbacktest/latest/hftbacktest/backtest/models/struct.ProbQueueModel.html>`_
     /// * `LogProbQueueFunc2 <https://docs.rs/hftbacktest/latest/hftbacktest/backtest/models/struct.LogProbQueueFunc2.html>`_
     pub fn log_prob_queue_model2(mut slf: PyRefMut<Self>) -> PyRefMut<Self> {
@@ -247,6 +263,7 @@ impl BacktestAsset {
     ///
     /// Please find the details below.
     ///
+    /// * `Order Fill - ProbQueueModel <https://hftbacktest.readthedocs.io/en/latest/order_fill.html#probqueuemodel>`_
     /// * `ProbQueueModel <https://docs.rs/hftbacktest/latest/hftbacktest/backtest/models/struct.ProbQueueModel.html>`_
     /// * `PowerProbQueueFunc <https://docs.rs/hftbacktest/latest/hftbacktest/backtest/models/struct.PowerProbQueueFunc.html>`_
     pub fn power_prob_queue_model(mut slf: PyRefMut<Self>, n: f64) -> PyRefMut<Self> {
@@ -258,6 +275,7 @@ impl BacktestAsset {
     ///
     /// Please find the details below.
     ///
+    /// * `Order Fill - ProbQueueModel <https://hftbacktest.readthedocs.io/en/latest/order_fill.html#probqueuemodel>`_
     /// * `ProbQueueModel <https://docs.rs/hftbacktest/latest/hftbacktest/backtest/models/struct.ProbQueueModel.html>`_
     /// * `PowerProbQueueFunc2 <https://docs.rs/hftbacktest/latest/hftbacktest/backtest/models/struct.PowerProbQueueFunc2.html>`_
     pub fn power_prob_queue_model2(mut slf: PyRefMut<Self>, n: f64) -> PyRefMut<Self> {
@@ -269,6 +287,7 @@ impl BacktestAsset {
     ///
     /// Please find the details below.
     ///
+    /// * `Order Fill - ProbQueueModel <https://hftbacktest.readthedocs.io/en/latest/order_fill.html#probqueuemodel>`_
     /// * `ProbQueueModel <https://docs.rs/hftbacktest/latest/hftbacktest/backtest/models/struct.ProbQueueModel.html>`_
     /// * `PowerProbQueueFunc3 <https://docs.rs/hftbacktest/latest/hftbacktest/backtest/models/struct.PowerProbQueueFunc3.html>`_
     pub fn power_prob_queue_model3(mut slf: PyRefMut<Self>, n: f64) -> PyRefMut<Self> {
@@ -288,7 +307,7 @@ impl BacktestAsset {
         len: usize,
     ) -> PyRefMut<Self> {
         let arr = slice_from_raw_parts_mut(data as *mut u8, len * size_of::<Event>());
-        let data = unsafe { Data::<Event>::from_ptr(arr, 0) };
+        let data = unsafe { Data::<Event>::from_data_ptr(DataPtr::from_ptr(arr), 0) };
         slf.initial_snapshot = Some(DataSource::Data(data));
         slf
     }
@@ -319,21 +338,49 @@ impl BacktestAsset {
         slf
     }
 
-    /// Sets the maker fee. A negative fee represents rebates.
-    pub fn maker_fee(mut slf: PyRefMut<Self>, maker_fee: f64) -> PyRefMut<Self> {
-        slf.maker_fee = maker_fee;
+    /// Sets the initial capacity of the vector storing the last market trades.
+    /// The default value is `0`, indicating that no last trades are stored.
+    pub fn last_trades_capacity(mut slf: PyRefMut<Self>, capacity: usize) -> PyRefMut<Self> {
+        slf.last_trades_cap = capacity;
         slf
     }
 
-    /// Sets the taker fee. A negative fee represents rebates.
-    pub fn taker_fee(mut slf: PyRefMut<Self>, taker_fee: f64) -> PyRefMut<Self> {
-        slf.taker_fee = taker_fee;
+    /// Uses `TradingValueFeeModel <https://docs.rs/hftbacktest/latest/hftbacktest/backtest/models/struct.TradingValueFeeModel.html>`_.
+    /// A negative fee represents rebates.
+    pub fn trading_value_fee_model(
+        mut slf: PyRefMut<Self>,
+        maker_fee: f64,
+        taker_fee: f64,
+    ) -> PyRefMut<Self> {
+        slf.fee_model = FeeModel::TradingValueFeeModel {
+            fees: CommonFees::new(maker_fee, taker_fee),
+        };
         slf
     }
 
-    /// Sets the initial capacity of the vector storing the trades occurring in the market.
-    pub fn trade_len(mut slf: PyRefMut<Self>, trade_len: usize) -> PyRefMut<Self> {
-        slf.trade_len = trade_len;
+    /// Uses `TradingQtyFeeModel <https://docs.rs/hftbacktest/latest/hftbacktest/backtest/models/struct.TradingQtyFeeModel.html>`_.
+    /// A negative fee represents rebates.
+    pub fn trading_qty_fee_model(
+        mut slf: PyRefMut<Self>,
+        maker_fee: f64,
+        taker_fee: f64,
+    ) -> PyRefMut<Self> {
+        slf.fee_model = FeeModel::TradingQtyFeeModel {
+            fees: CommonFees::new(maker_fee, taker_fee),
+        };
+        slf
+    }
+
+    /// Uses `FlatPerTradeFeeModel <https://docs.rs/hftbacktest/latest/hftbacktest/backtest/models/struct.FlatPerTradeFeeModel.html>`_.
+    /// A negative fee represents rebates.
+    pub fn flat_per_trade_fee_model(
+        mut slf: PyRefMut<Self>,
+        maker_fee: f64,
+        taker_fee: f64,
+    ) -> PyRefMut<Self> {
+        slf.fee_model = FeeModel::FlatPerTradeFeeModel {
+            fees: CommonFees::new(maker_fee, taker_fee),
+        };
         slf
     }
 }
@@ -379,7 +426,12 @@ pub fn build_hashmap_backtest(assets: Vec<PyRefMut<BacktestAsset>>) -> PyResult<
                 PowerProbQueueModel2 { n },
                 PowerProbQueueModel3 { n }
             ],
-            [NoPartialFillExchange {}, PartialFillExchange {}]
+            [NoPartialFillExchange {}, PartialFillExchange {}],
+            [
+                TradingValueFeeModel { fees },
+                TradingQtyFeeModel { fees },
+                FlatPerTradeFeeModel { fees },
+            ]
         );
         local.push(asst.local);
         exch.push(asst.exch);
@@ -416,7 +468,12 @@ pub fn build_roivec_backtest(assets: Vec<PyRefMut<BacktestAsset>>) -> PyResult<u
                 PowerProbQueueModel2 { n },
                 PowerProbQueueModel3 { n }
             ],
-            [NoPartialFillExchange {}, PartialFillExchange {}]
+            [NoPartialFillExchange {}, PartialFillExchange {}],
+            [
+                TradingValueFeeModel { fees },
+                TradingQtyFeeModel { fees },
+                FlatPerTradeFeeModel { fees },
+            ]
         );
         local.push(asst.local);
         exch.push(asst.exch);

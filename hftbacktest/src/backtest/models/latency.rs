@@ -1,8 +1,10 @@
 use std::mem;
 
+use hftbacktest_derive::NpyDTyped;
+
 use crate::{
     backtest::{
-        reader::{Cache, Data, DataSource, NpyFile, Reader, POD},
+        data::{Cache, Data, DataSource, Reader, POD},
         BacktestError,
     },
     types::Order,
@@ -53,22 +55,20 @@ impl LatencyModel for ConstantLatency {
 }
 
 /// The historical order latency data
-#[derive(Clone, Debug)]
 #[repr(C, align(32))]
+#[derive(Clone, Debug, NpyDTyped)]
 pub struct OrderLatencyRow {
     /// Timestamp at which the request occurs.
-    pub req_timestamp: i64,
+    pub req_ts: i64,
     /// Timestamp at which the exchange processes the request.
-    pub exch_timestamp: i64,
+    pub exch_ts: i64,
     /// Timestamp at which the response is received.
-    pub resp_timestamp: i64,
+    pub resp_ts: i64,
     /// For the alignment.
-    pub _reserved: i64,
+    pub _padding: i64,
 }
 
 unsafe impl POD for OrderLatencyRow {}
-
-unsafe impl NpyFile for OrderLatencyRow {}
 
 /// Provides order latency based on actual historical order latency data through interpolation.
 ///
@@ -116,12 +116,12 @@ impl IntpOrderLatency {
                 }
             }
         }
-        let data = match reader.next() {
+        let data = match reader.next_data() {
             Ok(data) => data,
             Err(BacktestError::EndOfData) => Data::empty(),
             Err(e) => return Err(e),
         };
-        let next_data = match reader.next() {
+        let next_data = match reader.next_data() {
             Ok(data) => data,
             Err(BacktestError::EndOfData) => Data::empty(),
             Err(e) => return Err(e),
@@ -144,9 +144,9 @@ impl IntpOrderLatency {
         (((y2 - y1) as f64) / ((x2 - x1) as f64) * ((x - x1) as f64)) as i64 + y1
     }
 
-    fn next(&mut self) -> Result<bool, BacktestError> {
-        if self.next_data.len() > 0 {
-            let next_data = match self.reader.next() {
+    fn next_data(&mut self) -> Result<bool, BacktestError> {
+        if !self.next_data.is_empty() {
+            let next_data = match self.reader.next_data() {
                 Ok(data) => data,
                 Err(BacktestError::EndOfData) => Data::empty(),
                 Err(e) => return Err(e),
@@ -164,35 +164,35 @@ impl IntpOrderLatency {
 impl LatencyModel for IntpOrderLatency {
     fn entry(&mut self, timestamp: i64, _order: &Order) -> i64 {
         let first_row = &self.data[0];
-        if timestamp < first_row.req_timestamp {
-            return first_row.exch_timestamp - first_row.req_timestamp;
+        if timestamp < first_row.req_ts {
+            return first_row.exch_ts - first_row.req_ts;
         }
 
         loop {
             let row = &self.data[self.entry_rn];
             let next_row = if self.entry_rn + 1 < self.data.len() {
                 &self.data[self.entry_rn + 1]
-            } else if self.next_data.len() > 0 {
+            } else if !self.next_data.is_empty() {
                 &self.next_data[0]
             } else {
                 let last_row = &self.data[self.data.len() - 1];
-                return last_row.exch_timestamp - last_row.req_timestamp;
+                return last_row.exch_ts - last_row.req_ts;
             };
 
-            let req_local_timestamp = row.req_timestamp;
-            let next_req_local_timestamp = next_row.req_timestamp;
+            let req_local_timestamp = row.req_ts;
+            let next_req_local_timestamp = next_row.req_ts;
 
-            if row.req_timestamp <= timestamp && timestamp < next_row.req_timestamp {
-                let exch_timestamp = row.exch_timestamp;
-                let next_exch_timestamp = next_row.exch_timestamp;
+            if row.req_ts <= timestamp && timestamp < next_row.req_ts {
+                let exch_timestamp = row.exch_ts;
+                let next_exch_timestamp = next_row.exch_ts;
 
                 // The exchange may reject an order request due to technical issues such
                 // congestion, this is particularly common in crypto markets. A timestamp of
                 // zero on the exchange represents the occurrence of those kinds of errors at
                 // that time.
                 if exch_timestamp <= 0 || next_exch_timestamp <= 0 {
-                    let resp_timestamp = row.resp_timestamp;
-                    let next_resp_timestamp = next_row.resp_timestamp;
+                    let resp_timestamp = row.resp_ts;
+                    let next_resp_timestamp = next_row.resp_ts;
                     let lat1 = resp_timestamp - req_local_timestamp;
                     let lat2 = next_resp_timestamp - next_req_local_timestamp;
 
@@ -217,40 +217,38 @@ impl LatencyModel for IntpOrderLatency {
                     next_req_local_timestamp,
                     lat2,
                 );
-            } else {
-                if self.entry_rn == self.data.len() - 1 {
-                    if self.next().unwrap() {
-                        self.entry_rn = 0;
-                    }
-                } else {
-                    self.entry_rn += 1;
+            } else if self.entry_rn == self.data.len() - 1 {
+                if self.next_data().unwrap() {
+                    self.entry_rn = 0;
                 }
+            } else {
+                self.entry_rn += 1;
             }
         }
     }
 
     fn response(&mut self, timestamp: i64, _order: &Order) -> i64 {
         let first_row = &self.data[0];
-        if timestamp < first_row.exch_timestamp {
-            return first_row.resp_timestamp - first_row.exch_timestamp;
+        if timestamp < first_row.exch_ts {
+            return first_row.resp_ts - first_row.exch_ts;
         }
 
         loop {
             let row = &self.data[self.resp_rn];
             let next_row = if self.resp_rn + 1 < self.data.len() {
                 &self.data[self.resp_rn + 1]
-            } else if self.next_data.len() > 0 {
+            } else if !self.next_data.is_empty() {
                 &self.next_data[0]
             } else {
                 let last_row = &self.data[self.data.len() - 1];
-                return last_row.resp_timestamp - last_row.exch_timestamp;
+                return last_row.resp_ts - last_row.exch_ts;
             };
 
-            let exch_timestamp = row.exch_timestamp;
-            let next_exch_timestamp = next_row.exch_timestamp;
+            let exch_timestamp = row.exch_ts;
+            let next_exch_timestamp = next_row.exch_ts;
             if exch_timestamp <= timestamp && timestamp < next_exch_timestamp {
-                let resp_local_timestamp = row.resp_timestamp;
-                let next_resp_local_timestamp = next_row.resp_timestamp;
+                let resp_local_timestamp = row.resp_ts;
+                let next_resp_local_timestamp = next_row.resp_ts;
 
                 let lat1 = resp_local_timestamp - exch_timestamp;
                 let lat2 = next_resp_local_timestamp - next_exch_timestamp;
@@ -258,14 +256,12 @@ impl LatencyModel for IntpOrderLatency {
                 let lat = self.intp(timestamp, exch_timestamp, lat1, next_exch_timestamp, lat2);
                 assert!(lat >= 0);
                 return lat;
-            } else {
-                if self.resp_rn == self.data.len() - 1 {
-                    if self.next().unwrap() {
-                        self.resp_rn = 0;
-                    }
-                } else {
-                    self.resp_rn += 1;
+            } else if self.resp_rn == self.data.len() - 1 {
+                if self.next_data().unwrap() {
+                    self.resp_rn = 0;
                 }
+            } else {
+                self.resp_rn += 1;
             }
         }
     }

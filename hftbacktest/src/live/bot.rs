@@ -109,13 +109,15 @@ async fn thread_main(
 pub type ErrorHandler = Box<dyn Fn(ErrorEvent) -> Result<(), BotError>>;
 pub type OrderRecvHook = Box<dyn Fn(&Order, &Order) -> Result<(), BotError>>;
 
+pub type DepthBuilder<MD> = Box<dyn FnMut(&Asset) -> MD>;
+
 /// Live [`LiveBot`] builder.
 pub struct LiveBotBuilder<MD> {
     conns: HashMap<String, Box<dyn Connector + Send + 'static>>,
     assets: Vec<(String, Asset)>,
     error_handler: Option<ErrorHandler>,
     order_hook: Option<OrderRecvHook>,
-    depth_builder: Option<Box<dyn FnMut(&Asset) -> MD>>,
+    depth_builder: Option<DepthBuilder<MD>>,
     trade_len: usize,
 }
 
@@ -350,13 +352,12 @@ where
                         } else if event.is(LOCAL_ASK_DEPTH_EVENT) {
                             let depth = unsafe { self.depth.get_unchecked_mut(asset_no) };
                             depth.update_ask_depth(event.px, event.qty, event.exch_ts);
-                        } else if event.is(LOCAL_BUY_TRADE_EVENT)
-                            || event.is(LOCAL_SELL_TRADE_EVENT)
+                        } else if (event.is(LOCAL_BUY_TRADE_EVENT)
+                            || event.is(LOCAL_SELL_TRADE_EVENT))
+                            && self.trade_len > 0
                         {
-                            if self.trade_len > 0 {
-                                let trade = unsafe { self.trade.get_unchecked_mut(asset_no) };
-                                trade.push(event);
-                            }
+                            let trade = unsafe { self.trade.get_unchecked_mut(asset_no) };
+                            trade.push(event);
                         }
                     }
                     if WAIT_NEXT_FEED {
@@ -364,16 +365,29 @@ where
                     }
                 }
                 Ok(LiveEvent::Feed { asset_no, event }) => {
-                    todo!();
+                    *unsafe { self.last_feed_latency.get_unchecked_mut(asset_no) } =
+                        Some((event.exch_ts, event.local_ts));
+                    if event.is(LOCAL_BID_DEPTH_EVENT) {
+                        let depth = unsafe { self.depth.get_unchecked_mut(asset_no) };
+                        depth.update_bid_depth(event.px, event.qty, event.exch_ts);
+                    } else if event.is(LOCAL_ASK_DEPTH_EVENT) {
+                        let depth = unsafe { self.depth.get_unchecked_mut(asset_no) };
+                        depth.update_ask_depth(event.px, event.qty, event.exch_ts);
+                    } else if (event.is(LOCAL_BUY_TRADE_EVENT) || event.is(LOCAL_SELL_TRADE_EVENT))
+                        && self.trade_len > 0
+                    {
+                        let trade = unsafe { self.trade.get_unchecked_mut(asset_no) };
+                        trade.push(event);
+                    }
                 }
                 Ok(LiveEvent::Order { asset_no, order }) => {
                     debug!(%asset_no, ?order, "Event::Order");
                     let received_order_resp = match wait_order_response {
                         WaitOrderResponse::Any => true,
-                        WaitOrderResponse::Specified(wait_order_asset_no, wait_order_id)
-                            if wait_order_id == order.order_id
-                                && wait_order_asset_no == asset_no =>
-                        {
+                        WaitOrderResponse::Specified {
+                            asset_no: wait_order_asset_no,
+                            order_id: wait_order_id,
+                        } if wait_order_id == order.order_id && wait_order_asset_no == asset_no => {
                             true
                         }
                         _ => false,
@@ -442,6 +456,7 @@ where
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn submit_order(
         &mut self,
         asset_no: usize,
@@ -527,7 +542,7 @@ where
     }
 
     #[inline]
-    fn trade(&self, asset_no: usize) -> &[Event] {
+    fn last_trades(&self, asset_no: usize) -> &[Event] {
         self.trade.get(asset_no).unwrap().as_slice()
     }
 
@@ -666,7 +681,7 @@ where
         order_id: OrderId,
         timeout: i64,
     ) -> Result<bool, Self::Error> {
-        self.elapse_::<false>(timeout, WaitOrderResponse::Specified(asset_no, order_id))
+        self.elapse_::<false>(timeout, WaitOrderResponse::Specified { asset_no, order_id })
     }
 
     #[inline]

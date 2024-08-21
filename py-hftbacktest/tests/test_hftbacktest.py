@@ -1,11 +1,12 @@
 import unittest
+import numpy as np
 
 from numba import njit
 
 from hftbacktest import (
     BacktestAsset,
-    MultiAssetMultiExchangeBacktest,
-    ALL_ASSETS
+    HashMapMarketDepthBacktest,
+    ALL_ASSETS, ROIVectorMarketDepthBacktest
 )
 
 
@@ -14,11 +15,11 @@ def test_run(hbt):
     order_id = 0
     while hbt.elapse(10_000_000_000) == 0:
         current_timestamp = hbt.current_timestamp
-        depth = hbt.depth_typed(0)
+        depth = hbt.depth(0)
         best_bid = depth.best_bid
         best_ask = depth.best_ask
 
-        # trades = hbt.trade_typed(0)
+        # trades = hbt.last_trades(0)
         #
         # i = 0
         # for trade in trades:
@@ -55,6 +56,8 @@ class TestPyHftBacktest(unittest.TestCase):
         pass
 
     def test_run_backtest(self):
+        arr = np.load('tmp_20240501.npz')['data']
+
         asset = (
             BacktestAsset()
                 .linear_asset(1.0)
@@ -65,8 +68,10 @@ class TestPyHftBacktest(unittest.TestCase):
                 .tick_size(0.000001)
                 .lot_size(1.0)
                 .trade_len(1000)
+                .roi_lb(0.0)
+                .roi_ub(1.0)
         )
-        # todo: providing the initial snapshot.
 
-        hbt = MultiAssetMultiExchangeBacktest([asset])
+        # hbt = HashMapMarketDepthMultiAssetMultiExchangeBacktest([asset])
+        hbt = ROIVectorMarketDepthBacktest([asset])
         test_run(hbt)
