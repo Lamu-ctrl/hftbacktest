@@ -178,7 +178,7 @@ pub async fn keep_connection(
         //     .flatten()
         //     .collect::<Vec<_>>();
         if let Err(error) = connect(
-            "wss://fx-ws.gateio.ws/v4/ws/btc",
+            "wss://fx-ws.gateio.ws/v4/ws/usdt",
             topics.clone(),
             symbol_list.clone(),
             ws_tx.clone(),
