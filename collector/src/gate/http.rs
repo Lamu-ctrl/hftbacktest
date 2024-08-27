@@ -1,7 +1,5 @@
 use std::{
-    io,
-    io::ErrorKind,
-    time::{Duration, Instant},
+    io::{self, ErrorKind}, sync::mpsc::SendError, time::{Duration, Instant}
 };
 
 use anyhow::Error;
@@ -38,17 +36,14 @@ pub async fn connect(
 
     for topic in topics {
         if topic == "futures.trades" {
-            for symbol in symbol_list.clone() {
-                let current_timestamp = Utc::now().timestamp_millis();
-                // println!("{}", format!(
-                //     r#"{{"time": {current_timestamp}, "channel": "futures.trades", "event": "subscribe", "payload": ["{symbol}"]}}"#
-                // ));
-                write
-                    .send(Message::Text(format!(
-                        r#"{{"time": {current_timestamp}, "channel": "futures.trades", "event": "subscribe", "payload": ["{symbol}"]}}"#
-                    )))
-                    .await?;
-            }
+            let current_timestamp = Utc::now().timestamp_millis();
+            let payload = symbol_list.join("\",\"");
+
+            write
+                .send(Message::Text(format!(
+                    r#"{{"time": {current_timestamp}, "channel": "futures.trades", "event": "subscribe", "payload": ["{payload}"]}}"#
+                )))
+                .await?;
         }
         else if topic == "futures.order_book" {
             for symbol in symbol_list.clone() {

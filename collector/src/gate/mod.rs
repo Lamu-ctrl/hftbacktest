@@ -13,18 +13,58 @@ fn handle(
     data: String,
 ) -> Result<(), ConnectorError> {
     let j: serde_json::Value = serde_json::from_str(&data)?;
-    // println!("{:?}", j);
     if let Some(j_channel) = j.get("channel") {
         let channel = j_channel.as_str().ok_or(ConnectorError::FormatError)?;
         // let symbol = topic.split(".").last().ok_or(ConnectorError::FormatError)?;
         // let _ = writer_tx.send((recv_time, symbol.to_string(), data));
+        
         if let Some(result_) = j.get("result") {
-            if let Some(contract_) = result_.get("contract") {
-                let symbol = contract_.as_str().unwrap();
-                // println!("{}", data);
-                let _ = writer_tx.send((recv_time, symbol.to_string(), data));
+            if channel == "futures.order" {
+                if let Some(contract_) = result_.get("contract") {
+                    let symbol = contract_.as_str().unwrap();
+                    // println!("{}", data);
+                    let _ = writer_tx.send((recv_time, symbol.to_string(), data));
+                    
+                }
                 
             }
+            else if channel == "futures.trades" {
+                let mut symbols = Vec::new();
+                if let Some(results) = result_.as_array() {
+                    for trade in results {
+                        if let Some(contract) = trade.get("contract").and_then(|c| c.as_str()) {
+                            if !symbols.contains(&contract.to_string()) {
+                                symbols.push(contract.to_string());
+                                break; // each futures.trades response only contains one symbol
+                            }
+                        }
+                    }
+                }
+                
+                for symbol in symbols {
+                    let _ = writer_tx.send((recv_time, symbol, data.clone()));
+                }
+            }
+            
+            else if channel == "futures.order_book_update" {
+                if let Some(contract_) = result_.get("s") {
+                    let symbol = contract_.as_str().unwrap();
+                    // println!("{}", data);
+                    let _ = writer_tx.send((recv_time, symbol.to_string(), data));
+                    
+                }
+                
+            }
+            else if channel == "futures.book_ticker" {
+                if let Some(contract_) = result_.get("s") {
+                    let symbol = contract_.as_str().unwrap();
+                    // println!("{}", data);
+                    let _ = writer_tx.send((recv_time, symbol.to_string(), data));
+                    
+                }
+                
+            }
+
         }
     } else if j.get("event").and_then(|v| v.as_str()) == Some("subscribe") {
         if let Some(result) = j.get("result") {
