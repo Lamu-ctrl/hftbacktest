@@ -113,13 +113,12 @@ def convert(
 
                     # event_time = data['E']
                     for trade in data:
-
-                        transaction_time = data['create_time_ms']
-                        price = data['price']
-                        qty = data['size']
+                        transaction_time = trade['create_time_ms']
+                        price = trade['price']
+                        qty = trade['size']
                         exch_timestamp = int(transaction_time) * timestamp_mul
                         tmp[row_num] = (
-                            TRADE_EVENT | (SELL_EVENT if data['size'] < 0 else BUY_EVENT), # trade initiator's side
+                            TRADE_EVENT | (SELL_EVENT if trade['size'] < 0 else BUY_EVENT), # trade initiator's side
                             exch_timestamp,
                             local_timestamp,
                             float(price),
@@ -133,7 +132,9 @@ def convert(
                     # event_time = data['E']
                     transaction_time = data['t']
                     exch_timestamp = int(transaction_time) * timestamp_mul
-                    for px, qty in data['b']:
+                    for ele in data['b']:
+                        px = ele.get('p')
+                        qty = ele.get('s')
                         tmp[row_num] = (
                             DEPTH_EVENT | BUY_EVENT,
                             exch_timestamp,
@@ -145,7 +146,9 @@ def convert(
                             0
                         )
                         row_num += 1
-                    for px, qty in data['a']:
+                    for ele in data['a']:
+                        px = ele.get('p')
+                        qty = ele.get('s')
                         tmp[row_num] = (
                             DEPTH_EVENT | SELL_EVENT,
                             exch_timestamp,
