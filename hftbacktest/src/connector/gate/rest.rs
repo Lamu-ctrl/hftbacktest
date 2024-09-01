@@ -2,19 +2,19 @@ use chrono::Utc;
 use serde::Deserialize;
 
 use crate::connector::{
-    bybit::msg::{Position, RestResponse},
+    gate::msg::{Position, RestResponse},
     util::sign_hmac_sha256,
 };
 
 #[derive(Clone)]
-pub struct BybitClient {
+pub struct GateClient {
     client: reqwest::Client,
     url: String,
     api_key: String,
     secret: String,
 }
 
-impl BybitClient {
+impl GateClient {
     pub fn new(url: &str, api_key: &str, secret: &str) -> Self {
         Self {
             client: reqwest::Client::new(),

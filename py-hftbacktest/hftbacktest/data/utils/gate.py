@@ -65,8 +65,8 @@ def convert(
              - ``m``: Processes ``markPriceUpdate`` stream with the following custom event IDs.
 
                 - index: ``100``
-                - mark price: ``101``
-                - funding rate: ``102``
+              - mark price: ``101``
+                  - funding rate: ``102``
 
              - ``t``: Processes ``bookTicker`` stream with the following custom event IDs.
 
@@ -88,6 +88,8 @@ def convert(
     Returns:
         Converted data compatible with HftBacktest.
     """
+    # prepare market info 
+    size_info = prepare_market_info()
     timestamp_slice = 19
     timestamp_mul = 1000000
 
@@ -115,7 +117,7 @@ def convert(
                     for trade in data:
                         transaction_time = trade['create_time_ms']
                         price = trade['price']
-                        qty = trade['size']
+                        qty = trade['size']*size_info[trade['contract']]
                         exch_timestamp = int(transaction_time) * timestamp_mul
                         tmp[row_num] = (
                             TRADE_EVENT | (SELL_EVENT if trade['size'] < 0 else BUY_EVENT), # trade initiator's side
@@ -273,3 +275,21 @@ def convert(
         np.savez_compressed(output_filename, data=data)
 
     return data
+
+
+def prepare_market_info():
+    # coding: utf-8
+    import requests
+    size_info={}
+    host = "https://api.gateio.ws"
+    prefix = "/api/v4"
+    headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
+
+    url = '/futures/usdt/contracts'
+    query_param = ''
+    r = requests.request('GET', host + prefix + url, headers=headers)
+
+    for contract in r.json():
+        size_info[contract['name']] = float(contract['quanto_multiplier'])
+
+    return size_info

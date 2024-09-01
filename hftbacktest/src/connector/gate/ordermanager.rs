@@ -8,7 +8,7 @@ use thiserror::Error;
 
 use crate::{
     connector::{
-        bybit::msg::{Execution, FastExecution, Order as BybitOrder, PrivateOrder},
+        gate::msg::{Execution, FastExecution, Order as GateOrder, PrivateOrder},
         util::gen_random_string,
     },
     prelude::{get_precision, OrdType, OrderId, Side, TimeInForce},
@@ -122,10 +122,10 @@ impl OrderManager {
         category: &str,
         asset_no: usize,
         order: Order,
-    ) -> Result<BybitOrder, HandleError> {
+    ) -> Result<GateOrder, HandleError> {
         let price_prec = get_precision(order.tick_size);
         let rand_id = gen_random_string(8);
-        let bybit_order = BybitOrder {
+        let gate_order = GateOrder {
             symbol: symbol.to_string(),
             side: Some({
                 match order.side {
@@ -166,10 +166,10 @@ impl OrderManager {
                 return Err(HandleError::OrderAlreadyExist);
             }
             Entry::Vacant(entry) => {
-                entry.insert((asset_no, bybit_order.order_link_id.clone(), order));
+                entry.insert((asset_no, gate_order.order_link_id.clone(), order));
             }
         }
-        Ok(bybit_order)
+        Ok(gate_order)
     }
 
     pub fn cancel_order(
@@ -177,12 +177,12 @@ impl OrderManager {
         symbol: &str,
         category: &str,
         order_id: OrderId,
-    ) -> Result<BybitOrder, HandleError> {
+    ) -> Result<GateOrder, HandleError> {
         let (_, order_link_id, order) = self
             .orders
             .get(&order_id)
             .ok_or(HandleError::OrderNotFound)?;
-        let bybit_order = BybitOrder {
+        let gate_order = GateOrder {
             symbol: symbol.to_string(),
             side: None,
             order_type: None,
@@ -192,7 +192,7 @@ impl OrderManager {
             time_in_force: None,
             order_link_id: order_link_id.clone(),
         };
-        Ok(bybit_order)
+        Ok(gate_order)
     }
 
     pub fn update_submit_fail(

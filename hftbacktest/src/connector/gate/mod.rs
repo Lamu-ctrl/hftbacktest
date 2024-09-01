@@ -320,7 +320,7 @@ impl Connector for Gate {
         let public_url = self.public_url.clone();
         let ev_tx_public = ev_tx.clone();
         let assets_public = self.assets.clone();
-        let mut topics = vec!["orderbook.50".to_string(), "publicTrade".to_string()];
+        let mut topics = vec!["futures.order_book".to_string(), "futures.order_book_update".to_string(),"futures.trades".to_string()];
         for topic in self.topics.iter() {
             topics.push(topic.clone());
         }

@@ -13,11 +13,11 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     connector::{
-        bybit::{
+        gate::{
             msg,
             msg::{
                 Op,
-                Order as BybitOrder,
+                Order as GateOrder,
                 OrderBook,
                 PrivateStreamMsg,
                 PrivateStreamTopicMsg,
@@ -26,7 +26,7 @@ use crate::{
                 TradeStreamMsg,
             },
             ordermanager::{HandleError, OrderManagerWrapper},
-            BybitError,
+            GateError,
         },
         util::{gen_random_string, sign_hmac_sha256},
     },
@@ -48,7 +48,7 @@ use crate::{
 
 pub struct OrderOp {
     pub op: String,
-    pub bybit_order: BybitOrder,
+    pub gate_order: GateOrder,
     pub tx: Sender<LiveEvent>,
 }
 
@@ -208,32 +208,86 @@ pub async fn connect_public(
     let mut interval = time::interval(Duration::from_secs(15));
 
     let mut args = Vec::new();
+    // for topic in topics {
+    //     let mut topics_ = assets
+    //         .keys()
+    //         .map(|symbol| format!("{topic}.{symbol}"))
+    //         .collect();
+    //     args.append(&mut topics_);
+    // }
+
+    // let op = Op {
+    //     req_id: "subscribe".to_string(),
+    //     op: "subscribe".to_string(),
+    //     args,
+    // };
+    // let s = serde_json::to_string(&op).unwrap();
+    // write.send(Message::Text(s)).await?;
+
+    let symbol_list: Vec<String> = assets.keys().cloned().collect();
+    println!("{:?}", symbol_list);
     for topic in topics {
-        let mut topics_ = assets
-            .keys()
-            .map(|symbol| format!("{topic}.{symbol}"))
-            .collect();
-        args.append(&mut topics_);
+        if topic == "futures.trades" {
+            let current_timestamp = Utc::now().timestamp_millis();
+            let payload = symbol_list.join("\",\"");
+
+            write
+                .send(Message::Text(format!(
+                    r#"{{"time": {current_timestamp}, "channel": "futures.trades", "event": "subscribe", "payload": ["{payload}"]}}"#
+                )))
+                .await?;
+        }
+        else if topic == "futures.order_book" {
+            for symbol in symbol_list.clone() {
+                let current_timestamp = Utc::now().timestamp_millis();
+                write
+                    .send(Message::Text(format!(
+                        r#"{{"time": {current_timestamp}, "channel": "futures.order_book", "event": "subscribe", "payload": ["{symbol}","100","0"]}}"#
+                    )))
+                    .await?;
+            }
+        }
+        else if topic == "futures.book_ticker" {
+            for symbol in symbol_list.clone() {
+                let current_timestamp = Utc::now().timestamp_millis();
+                write
+                    .send(Message::Text(format!(
+                        r#"{{"time": {current_timestamp}, "channel": "futures.book_ticker", "event": "subscribe", "payload": ["{symbol}"]}}"#
+                    )))
+                    .await?;
+            }
+        }
+        else if topic == "futures.order_book_update" {
+            for symbol in symbol_list.clone() {
+                let current_timestamp = Utc::now().timestamp_millis();
+                write
+                    .send(Message::Text(format!(
+                        r#"{{"time": {current_timestamp}, "channel": "futures.order_book_update", "event": "subscribe", "payload": ["{symbol}","20ms","20"]}}"#
+                    )))
+                    .await?;
+            }
+        }
     }
-
-    let op = Op {
-        req_id: "subscribe".to_string(),
-        op: "subscribe".to_string(),
-        args,
-    };
-    let s = serde_json::to_string(&op).unwrap();
-    write.send(Message::Text(s)).await?;
-
     loop {
         select! {
-            _ = interval.tick() => {
-                let op = Op {
-                    req_id: "ping".to_string(),
-                    op: "ping".to_string(),
-                    args: vec![]
-                };
-                let s = serde_json::to_string(&op).unwrap();
-                write.send(Message::Text(s)).await?;
+            // _ = interval.tick() => {
+            //     let op = Op {
+            //         req_id: "ping".to_string(),
+            //         op: "ping".to_string(),
+            //         args: vec![]
+            //     };
+            //     let s = serde_json::to_string(&op).unwrap();
+            //     write.send(Message::Text(s)).await?;
+            // }
+            _ = ping_interval.tick() => {
+                let current_timestamp = Utc::now().timestamp_millis();
+                if let Err(_) = write.send(
+                    Message::Text(format!(
+                        r#"{{"time": {current_timestamp}, "channel" : "futures.ping"}}"#
+                    ))
+                ).await {
+                    return;
+                }
             }
             message = read.next() => {
                 match message {
@@ -479,7 +533,7 @@ pub async fn connect_trade(
                             let rand_id = gen_random_string(8);
                             format!(
                                 "{}/{}",
-                                order.bybit_order.order_link_id.clone(),
+                                order.gate_order.order_link_id.clone(),
                                 rand_id,
                             )
                         };
@@ -498,7 +552,7 @@ pub async fn connect_trade(
                                 header
                             },
                             op: order.op,
-                            args: vec![order.bybit_order]
+                            args: vec![order.gate_order]
                         };
                         let s = serde_json::to_string(&op).unwrap();
                         write.send(Message::Text(s)).await?;
@@ -553,7 +607,7 @@ async fn handle_trade_stream(
     let stream = serde_json::from_str::<TradeStreamMsg>(text)?;
     if stream.op == "auth" {
         if stream.ret_code != 0 {
-            let err = BybitError::AuthError {
+            let err = GateError::AuthError {
                 code: stream.ret_code,
                 msg: stream.ret_msg.clone(),
             };
@@ -582,7 +636,7 @@ async fn handle_trade_stream(
             ev_tx
                 .send(LiveEvent::Error(LiveError::with(
                     ErrorKind::OrderError,
-                    BybitError::OrderError {
+                    GateError::OrderError {
                         code: stream.ret_code,
                         msg: stream.ret_msg.clone(),
                     }
@@ -607,7 +661,7 @@ async fn handle_trade_stream(
             ev_tx
                 .send(LiveEvent::Error(LiveError::with(
                     ErrorKind::OrderError,
-                    BybitError::OrderError {
+                    GateError::OrderError {
                         code: stream.ret_code,
                         msg: stream.ret_msg.clone(),
                     }
