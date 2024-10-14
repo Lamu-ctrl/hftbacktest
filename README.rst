@@ -17,7 +17,7 @@ support the following features.
 
 * Working in `Numba <https://numba.pydata.org/>`_ JIT function (Python).
 * Complete tick-by-tick simulation with a customizable time interval or based on the feed and order receipt.
-* Full order book reconstruction based on L2 Market-By-Price and L3 Market-By-Order (Rust-only, WIP) feeds.
+* Full order book reconstruction based on L2 Market-By-Price and L3 Market-By-Order feeds.
 * Backtest accounting for both feed and order latency, using provided models or your own custom model.
 * Order fill simulation that takes into account the order queue position, using provided models or your own custom model.
 * Backtesting of multi-asset and multi-exchange models
@@ -168,6 +168,9 @@ Tutorials
 * `Guéant–Lehalle–Fernandez-Tapia Market Making Model and Grid Trading <https://hftbacktest.readthedocs.io/en/latest/tutorials/GLFT%20Market%20Making%20Model%20and%20Grid%20Trading.html>`_
 * `Making Multiple Markets <https://hftbacktest.readthedocs.io/en/latest/tutorials/Making%20Multiple%20Markets.html>`_
 * `Risk Mitigation through Price Protection in Extreme Market Conditions <https://hftbacktest.readthedocs.io/en/latest/tutorials/Risk%20Mitigation%20through%20Price%20Protection%20in%20Extreme%20Market%20Conditions.html>`_
+* `Level-3 Backtesting <https://hftbacktest.readthedocs.io/en/latest/tutorials/Level-3%20Backtesting.html>`_
+* `Market Making with Alpha - Order Book Imbalance <https://hftbacktest.readthedocs.io/en/latest/tutorials/Market%20Making%20with%20Alpha%20-%20Order%20Book%20Imbalance.html>`_
+* `Queue-Based Market Making in Large Tick Size Assets <https://hftbacktest.readthedocs.io/en/latest/tutorials/Queue-Based%20Market%20Making%20in%20Large%20Tick%20Size%20Assets.html>`_
 
 Examples
 ========
@@ -238,6 +241,6 @@ Please see the `roadmap <https://github.com/nkaz001/hftbacktest/blob/master/ROAD
     :target: https://github.com/nkaz001/hftbacktest
     :alt: Github
 
-.. |rustc| image:: https://shields.io/badge/rustc-1.79-blue
+.. |rustc| image:: https://shields.io/badge/rustc-1.81.0-blue
     :alt: Rust Version
     :target: https://www.rust-lang.org/

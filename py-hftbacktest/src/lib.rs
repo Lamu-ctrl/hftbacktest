@@ -5,12 +5,13 @@ pub use depth::*;
 use hftbacktest::{
     backtest::{
         assettype::{InverseAsset, LinearAsset},
-        data::{read_npz_file, Cache, Data, DataPtr, Reader},
+        data::{read_npz_file, Data, DataPtr, FeedLatencyAdjustment, Reader},
         models::{
             CommonFees,
             ConstantLatency,
             FlatPerTradeFeeModel,
             IntpOrderLatency,
+            L3FIFOQueueModel,
             LogProbQueueFunc,
             LogProbQueueFunc2,
             OrderLatencyRow,
@@ -23,20 +24,32 @@ use hftbacktest::{
             TradingValueFeeModel,
         },
         order::OrderBus,
-        proc::{Local, LocalProcessor, NoPartialFillExchange, PartialFillExchange, Processor},
+        proc::{
+            L3Local,
+            L3NoPartialFillExchange,
+            Local,
+            LocalProcessor,
+            NoPartialFillExchange,
+            PartialFillExchange,
+            Processor,
+        },
         state::State,
         Asset,
         Backtest,
         DataSource,
     },
+    live::{Instrument, LiveBotBuilder},
     prelude::{ApplySnapshot, Event, HashMapMarketDepth, ROIVectorMarketDepth},
 };
 use hftbacktest_derive::build_asset;
 pub use order::*;
-use pyo3::prelude::*;
+use pyo3::{exceptions::PyValueError, prelude::*};
+
+use crate::live::{HashMapMarketDepthLiveBot, ROIVectorMarketDepthLiveBot};
 
 mod backtest;
 mod depth;
+mod live;
 mod order;
 
 #[derive(Clone)]
@@ -53,6 +66,7 @@ pub enum LatencyModel {
     },
     IntpOrderLatency {
         data: Vec<DataSource<OrderLatencyRow>>,
+        latency_offset: i64,
     },
 }
 
@@ -64,6 +78,7 @@ pub enum QueueModel {
     LogProbQueueModel2 {},
     PowerProbQueueModel2 { n: f64 },
     PowerProbQueueModel3 { n: f64 },
+    L3FIFOQueueModel {},
 }
 
 #[derive(Clone)]
@@ -94,13 +109,15 @@ pub struct BacktestAsset {
     roi_ub: f64,
     initial_snapshot: Option<DataSource<Event>>,
     fee_model: FeeModel,
+    latency_offset: i64,
+    parallel_load: bool,
 }
 
 unsafe impl Send for BacktestAsset {}
 
 #[pymethods]
 impl BacktestAsset {
-    /// Constructs an instance of `AssetBuilder`.
+    /// Constructs an instance of `BacktestAsset`.
     #[allow(clippy::new_without_default)]
     #[new]
     pub fn new() -> Self {
@@ -122,7 +139,32 @@ impl BacktestAsset {
             fee_model: FeeModel::TradingValueFeeModel {
                 fees: CommonFees::new(0.0, 0.0),
             },
+            latency_offset: 0,
+            parallel_load: true,
         }
+    }
+
+    /// Sets whether to load the next data in parallel with backtesting. This can speed up the
+    /// backtest by reducing data loading time, but it also increases memory usage.
+    ///
+    /// Args:
+    ///     preload: whether to preload the next data in parallel with backtesting.
+    ///              The default value is `True`.
+    pub fn parallel_load(mut slf: PyRefMut<Self>, parallel_load: bool) -> PyRefMut<Self> {
+        slf.parallel_load = parallel_load;
+        slf
+    }
+
+    /// Sets the latency offset to adjust the feed latency by the specified amount. This is
+    /// particularly useful in cross-exchange backtesting, where the feed data is collected from a
+    /// different site than the one where the strategy is intended to run.
+    ///
+    /// Args:
+    ///     latency_offset: offset to adjust the feed latency by the specified amount.
+    ///                     The default value is `0`.
+    pub fn latency_offset(mut slf: PyRefMut<Self>, latency_offset: i64) -> PyRefMut<Self> {
+        slf.latency_offset = latency_offset;
+        slf
     }
 
     /// Sets the lower bound price of the `ROIVectorMarketDepth <https://docs.rs/hftbacktest/latest/hftbacktest/depth/struct.ROIVectorMarketDepth.html>`_.
@@ -203,12 +245,21 @@ impl BacktestAsset {
     ///
     /// Args:
     ///     data: a list of file paths for the historical order latency data in `npz`.
-    pub fn intp_order_latency(mut slf: PyRefMut<Self>, data: Vec<String>) -> PyRefMut<Self> {
+    ///     latency_offset: the latency offset to adjust the order entry and response latency by the
+    ///                     specified amount. This is particularly useful in cross-exchange
+    ///                     backtesting, where the feed data is collected from a different site than
+    ///                     the one where the strategy is intended to run.
+    pub fn intp_order_latency(
+        mut slf: PyRefMut<Self>,
+        data: Vec<String>,
+        latency_offset: i64,
+    ) -> PyRefMut<Self> {
         slf.latency_model = LatencyModel::IntpOrderLatency {
             data: data
                 .iter()
                 .map(|file| DataSource::File(file.to_string()))
                 .collect(),
+            latency_offset,
         };
         slf
     }
@@ -217,11 +268,13 @@ impl BacktestAsset {
         mut slf: PyRefMut<Self>,
         data: usize,
         len: usize,
+        latency_offset: i64,
     ) -> PyRefMut<Self> {
         let arr = slice_from_raw_parts_mut(data as *mut u8, len * size_of::<OrderLatencyRow>());
         let data = unsafe { Data::<OrderLatencyRow>::from_data_ptr(DataPtr::from_ptr(arr), 0) };
         slf.latency_model = LatencyModel::IntpOrderLatency {
             data: vec![DataSource::Data(data)],
+            latency_offset,
         };
         slf
     }
@@ -292,6 +345,17 @@ impl BacktestAsset {
     /// * `PowerProbQueueFunc3 <https://docs.rs/hftbacktest/latest/hftbacktest/backtest/models/struct.PowerProbQueueFunc3.html>`_
     pub fn power_prob_queue_model3(mut slf: PyRefMut<Self>, n: f64) -> PyRefMut<Self> {
         slf.queue_model = QueueModel::PowerProbQueueModel3 { n };
+        slf
+    }
+
+    /// Uses the `L3FIFOQueueModel` for the queue position model.
+    ///
+    /// Please find the details below.
+    ///
+    /// * `Order Fill <https://hftbacktest.readthedocs.io/en/latest/order_fill.html>`_
+    /// * `L3FIFOQueueModel <https://docs.rs/hftbacktest/latest/hftbacktest/backtest/models/struct.L3FIFOQueueModel.html>`_
+    pub fn l3_fifo_queue_model(mut slf: PyRefMut<Self>) -> PyRefMut<Self> {
+        slf.queue_model = QueueModel::L3FIFOQueueModel {};
         slf
     }
 
@@ -389,7 +453,10 @@ impl BacktestAsset {
 fn _hftbacktest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(build_hashmap_backtest, m)?)?;
     m.add_function(wrap_pyfunction!(build_roivec_backtest, m)?)?;
+    m.add_function(wrap_pyfunction!(build_hashmap_livebot, m)?)?;
+    m.add_function(wrap_pyfunction!(build_roivec_livebot, m)?)?;
     m.add_class::<BacktestAsset>()?;
+    m.add_class::<LiveInstrument>()?;
     Ok(())
 }
 
@@ -404,6 +471,14 @@ pub fn build_hashmap_backtest(assets: Vec<PyRefMut<BacktestAsset>>) -> PyResult<
     let mut local = Vec::new();
     let mut exch = Vec::new();
     for asset in assets {
+        if let (QueueModel::L3FIFOQueueModel {}, ExchangeKind::PartialFillExchange {}) =
+            (&asset.queue_model, &asset.exch_kind)
+        {
+            return PyResult::Err(PyErr::new::<PyValueError, _>(
+                "L3PartialFillExchange is unsupported.",
+            ));
+        }
+
         let asst = build_asset!(
             asset,
             HashMapMarketDepth,
@@ -416,7 +491,10 @@ pub fn build_hashmap_backtest(assets: Vec<PyRefMut<BacktestAsset>>) -> PyResult<
                     entry_latency,
                     resp_latency
                 },
-                IntpOrderLatency { data }
+                IntpOrderLatency {
+                    data,
+                    latency_offset
+                }
             ],
             [
                 RiskAdverseQueueModel {},
@@ -424,7 +502,8 @@ pub fn build_hashmap_backtest(assets: Vec<PyRefMut<BacktestAsset>>) -> PyResult<
                 LogProbQueueModel2 {},
                 PowerProbQueueModel { n },
                 PowerProbQueueModel2 { n },
-                PowerProbQueueModel3 { n }
+                PowerProbQueueModel3 { n },
+                L3FIFOQueueModel {}
             ],
             [NoPartialFillExchange {}, PartialFillExchange {}],
             [
@@ -446,6 +525,14 @@ pub fn build_roivec_backtest(assets: Vec<PyRefMut<BacktestAsset>>) -> PyResult<u
     let mut local = Vec::new();
     let mut exch = Vec::new();
     for asset in assets {
+        if let (QueueModel::L3FIFOQueueModel {}, ExchangeKind::PartialFillExchange {}) =
+            (&asset.queue_model, &asset.exch_kind)
+        {
+            return PyResult::Err(PyErr::new::<PyValueError, _>(
+                "L3PartialFillExchange is unsupported.",
+            ));
+        }
+
         let asst = build_asset!(
             asset,
             ROIVectorMarketDepth,
@@ -458,7 +545,10 @@ pub fn build_roivec_backtest(assets: Vec<PyRefMut<BacktestAsset>>) -> PyResult<u
                     entry_latency,
                     resp_latency
                 },
-                IntpOrderLatency { data }
+                IntpOrderLatency {
+                    data,
+                    latency_offset
+                }
             ],
             [
                 RiskAdverseQueueModel {},
@@ -466,7 +556,8 @@ pub fn build_roivec_backtest(assets: Vec<PyRefMut<BacktestAsset>>) -> PyResult<u
                 LogProbQueueModel2 {},
                 PowerProbQueueModel { n },
                 PowerProbQueueModel2 { n },
-                PowerProbQueueModel3 { n }
+                PowerProbQueueModel3 { n },
+                L3FIFOQueueModel {}
             ],
             [NoPartialFillExchange {}, PartialFillExchange {}],
             [
@@ -480,5 +571,137 @@ pub fn build_roivec_backtest(assets: Vec<PyRefMut<BacktestAsset>>) -> PyResult<u
     }
 
     let hbt = Backtest::new(local, exch);
+    Ok(Box::into_raw(Box::new(hbt)) as *mut c_void as usize)
+}
+
+/// Builds a live trading instrument.
+#[pyclass]
+pub struct LiveInstrument {
+    connector_name: String,
+    symbol: String,
+    tick_size: f64,
+    lot_size: f64,
+    last_trades_cap: usize,
+    roi_lb: f64,
+    roi_ub: f64,
+}
+
+unsafe impl Send for LiveInstrument {}
+
+#[pymethods]
+impl LiveInstrument {
+    /// Constructs an instance of `LiveInstrument`.
+    #[allow(clippy::new_without_default)]
+    #[new]
+    pub fn new() -> Self {
+        Self {
+            connector_name: String::new(),
+            symbol: String::new(),
+            tick_size: 0.0,
+            lot_size: 0.0,
+            last_trades_cap: 0,
+            roi_lb: 0.0,
+            roi_ub: 0.0,
+        }
+    }
+
+    /// Sets a connector name.
+    pub fn connector(mut slf: PyRefMut<Self>, name: String) -> PyRefMut<Self> {
+        slf.connector_name = name;
+        slf
+    }
+
+    /// Sets a symbol.
+    pub fn symbol(mut slf: PyRefMut<Self>, symbol: String) -> PyRefMut<Self> {
+        slf.symbol = symbol;
+        slf
+    }
+
+    /// Sets the tick size of the asset.
+    pub fn tick_size(mut slf: PyRefMut<Self>, tick_size: f64) -> PyRefMut<Self> {
+        slf.tick_size = tick_size;
+        slf
+    }
+
+    /// Sets the lot size of the asset.
+    pub fn lot_size(mut slf: PyRefMut<Self>, lot_size: f64) -> PyRefMut<Self> {
+        slf.lot_size = lot_size;
+        slf
+    }
+
+    /// Sets the initial capacity of the vector storing the last market trades.
+    /// The default value is `0`, indicating that no last trades are stored.
+    pub fn last_trades_capacity(mut slf: PyRefMut<Self>, capacity: usize) -> PyRefMut<Self> {
+        slf.last_trades_cap = capacity;
+        slf
+    }
+
+    /// Sets the lower bound price of the `ROIVectorMarketDepth <https://docs.rs/hftbacktest/latest/hftbacktest/depth/struct.ROIVectorMarketDepth.html>`_.
+    /// Only valid if `ROIVectorMarketDepthLiveBot` is built.
+    ///
+    /// Args:
+    ///     roi_lb: the lower bound price of the range of interest.
+    pub fn roi_lb(mut slf: PyRefMut<Self>, roi_lb: f64) -> PyRefMut<Self> {
+        slf.roi_lb = roi_lb;
+        slf
+    }
+
+    /// Sets the upper bound price of the `ROIVectorMarketDepth <https://docs.rs/hftbacktest/latest/hftbacktest/depth/struct.ROIVectorMarketDepth.html>`_.
+    /// Only valid if `ROIVectorMarketDepthLiveBot` is built.
+    ///
+    /// Args:
+    ///     roi_ub: the upper bound price of the range of interest.
+    pub fn roi_ub(mut slf: PyRefMut<Self>, roi_ub: f64) -> PyRefMut<Self> {
+        slf.roi_ub = roi_ub;
+        slf
+    }
+}
+
+#[pyfunction]
+pub fn build_hashmap_livebot(instruments: Vec<PyRefMut<LiveInstrument>>) -> PyResult<usize> {
+    let mut builder = LiveBotBuilder::new();
+    for instrument in instruments {
+        builder = builder.register(Instrument::new(
+            &instrument.connector_name,
+            &instrument.symbol,
+            instrument.tick_size,
+            instrument.lot_size,
+            HashMapMarketDepth::new(instrument.tick_size, instrument.lot_size),
+            instrument.last_trades_cap,
+        ));
+    }
+    let hbt: HashMapMarketDepthLiveBot = builder
+        .error_handler(|_error| Ok(()))
+        .order_recv_hook(|_prev, _new| Ok(()))
+        .build()
+        .unwrap();
+
+    Ok(Box::into_raw(Box::new(hbt)) as *mut c_void as usize)
+}
+
+#[pyfunction]
+pub fn build_roivec_livebot(instruments: Vec<PyRefMut<LiveInstrument>>) -> PyResult<usize> {
+    let mut builder = LiveBotBuilder::new();
+    for instrument in instruments {
+        builder = builder.register(Instrument::new(
+            &instrument.connector_name,
+            &instrument.symbol,
+            instrument.tick_size,
+            instrument.lot_size,
+            ROIVectorMarketDepth::new(
+                instrument.tick_size,
+                instrument.lot_size,
+                instrument.roi_lb,
+                instrument.roi_ub,
+            ),
+            instrument.last_trades_cap,
+        ));
+    }
+    let hbt: ROIVectorMarketDepthLiveBot = builder
+        .error_handler(|_error| Ok(()))
+        .order_recv_hook(|_prev, _new| Ok(()))
+        .build()
+        .unwrap();
+
     Ok(Box::into_raw(Box::new(hbt)) as *mut c_void as usize)
 }

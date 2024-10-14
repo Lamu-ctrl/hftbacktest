@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    collections::{hash_map::Entry, HashMap, HashSet},
+    collections::{hash_map::Entry, HashMap, HashSet, VecDeque},
     marker::PhantomData,
 };
 
@@ -444,6 +444,7 @@ pub trait L3QueueModel<MD> {
     fn fill_market_feed_order<const DELETE: bool>(
         &mut self,
         order_id: OrderId,
+        order: &Event,
         depth: &MD,
     ) -> Result<Vec<Order>, BacktestError>;
 
@@ -479,8 +480,8 @@ pub struct L3FIFOQueueModel {
     pub mkt_feed_orders: HashMap<OrderId, (Side, i64)>,
     // Since LinkedList's cursor is still unstable, there is no efficient way to delete an item in a
     // linked list, so it is better to use a vector.
-    pub bid_queue: HashMap<i64, Vec<Order>>,
-    pub ask_queue: HashMap<i64, Vec<Order>>,
+    pub bid_queue: HashMap<i64, VecDeque<Order>>,
+    pub ask_queue: HashMap<i64, VecDeque<Order>>,
 }
 
 impl L3FIFOQueueModel {
@@ -494,9 +495,10 @@ impl L3FIFOQueueModel {
         from_tick: i64,
         to_tick: i64,
     ) -> Vec<Order> {
+        assert!(to_tick <= from_tick);
         // Finds the shortest iteration.
         let mut filled = Vec::new();
-        if INVALID_FROM || (self.backtest_orders.len() as i64) < to_tick - from_tick {
+        if INVALID_FROM || (self.backtest_orders.len() as i64) < from_tick - to_tick {
             let mut filled_tick = HashSet::new();
             self.backtest_orders.retain(|_, (side, order_price_tick)| {
                 if *side == Side::Buy && *order_price_tick >= to_tick {
@@ -522,6 +524,7 @@ impl L3FIFOQueueModel {
                 if let Some(queue) = self.bid_queue.get_mut(&t) {
                     queue.retain(|order| {
                         if order.is_backtest_order() {
+                            self.backtest_orders.remove(&order.order_id);
                             filled.push(order.clone());
                             false
                         } else {
@@ -539,9 +542,10 @@ impl L3FIFOQueueModel {
         from_tick: i64,
         to_tick: i64,
     ) -> Vec<Order> {
+        assert!(from_tick <= to_tick);
         // Finds the shortest iteration.
         let mut filled = Vec::new();
-        if INVALID_FROM || (self.backtest_orders.len() as i64) < from_tick - to_tick {
+        if INVALID_FROM || (self.backtest_orders.len() as i64) < to_tick - from_tick {
             let mut filled_tick = HashSet::new();
             self.backtest_orders.retain(|_, (side, order_price_tick)| {
                 if *side == Side::Sell && *order_price_tick <= to_tick {
@@ -567,6 +571,7 @@ impl L3FIFOQueueModel {
                 if let Some(queue) = self.ask_queue.get_mut(&t) {
                     queue.retain(|order| {
                         if order.is_backtest_order() {
+                            self.backtest_orders.remove(&order.order_id);
                             filled.push(order.clone());
                             false
                         } else {
@@ -625,7 +630,7 @@ where
             Side::None | Side::Unsupported => unreachable!(),
         };
 
-        queue.push(order);
+        queue.push_back(order);
 
         match self.backtest_orders.entry(order_id) {
             Entry::Occupied(_) => Err(BacktestError::OrderIdExist),
@@ -652,7 +657,7 @@ where
             unreachable!()
         };
 
-        queue.push(Order {
+        queue.push_back(Order {
             qty: order.qty,
             leaves_qty: order.qty,
             price_tick: order_price_tick,
@@ -694,35 +699,29 @@ where
         match side {
             Side::Buy => {
                 let queue = self.bid_queue.get_mut(&order_price_tick).unwrap();
-                let mut pos = None;
-                for (i, order_in_q) in queue.iter().enumerate() {
-                    if order_in_q.is_backtest_order() && order_in_q.order_id == order_id {
-                        pos = Some(i);
-                        break;
+                for i in 0..queue.len() {
+                    if queue[i].is_backtest_order() && queue[i].order_id == order_id {
+                        let order = queue.remove(i).unwrap();
+                        // if queue.len() == 0 {
+                        //     self.bid_queue.remove(&order_price_tick);
+                        // }
+                        return Ok(order);
                     }
                 }
-
-                let order = queue.remove(pos.ok_or(BacktestError::OrderNotFound)?);
-                // if queue.len() == 0 {
-                //     self.bid_queue.remove(&order_price_tick);
-                // }
-                Ok(order)
+                unreachable!()
             }
             Side::Sell => {
                 let queue = self.ask_queue.get_mut(&order_price_tick).unwrap();
-                let mut pos = None;
-                for (i, order_in_q) in queue.iter().enumerate() {
-                    if order_in_q.is_backtest_order() && order_in_q.order_id == order_id {
-                        pos = Some(i);
-                        break;
+                for i in 0..queue.len() {
+                    if queue[i].is_backtest_order() && queue[i].order_id == order_id {
+                        let order = queue.remove(i).unwrap();
+                        // if queue.len() == 0 {
+                        //     self.ask_queue.remove(&order_price_tick);
+                        // }
+                        return Ok(order);
                     }
                 }
-
-                let order = queue.remove(pos.ok_or(BacktestError::OrderNotFound)?);
-                // if queue.len() == 0 {
-                //     self.ask_queue.remove(&order_price_tick);
-                // }
-                Ok(order)
+                unreachable!()
             }
             Side::None | Side::Unsupported => unreachable!(),
         }
@@ -741,35 +740,29 @@ where
         match side {
             Side::Buy => {
                 let queue = self.bid_queue.get_mut(&order_price_tick).unwrap();
-                let mut pos = None;
-                for (i, order_in_q) in queue.iter().enumerate() {
-                    if order_in_q.is_market_feed_order() && order_in_q.order_id == order_id {
-                        pos = Some(i);
-                        break;
+                for i in 0..queue.len() {
+                    if queue[i].is_market_feed_order() && queue[i].order_id == order_id {
+                        queue.remove(i);
+                        // if queue.len() == 0 {
+                        //     self.bid_queue.remove(&order_price_tick);
+                        // }
+                        return Ok(());
                     }
                 }
-
-                queue.remove(pos.ok_or(BacktestError::OrderNotFound)?);
-                // if queue.len() == 0 {
-                //     self.bid_queue.remove(&order_price_tick);
-                // }
-                Ok(())
+                unreachable!()
             }
             Side::Sell => {
                 let queue = self.ask_queue.get_mut(&order_price_tick).unwrap();
-                let mut pos = None;
-                for (i, order_in_q) in queue.iter().enumerate() {
-                    if order_in_q.is_market_feed_order() && order_in_q.order_id == order_id {
-                        pos = Some(i);
-                        break;
+                for i in 0..queue.len() {
+                    if queue[i].is_market_feed_order() && queue[i].order_id == order_id {
+                        queue.remove(i);
+                        // if queue.len() == 0 {
+                        //     self.ask_queue.remove(&order_price_tick);
+                        // }
+                        return Ok(());
                     }
                 }
-
-                queue.remove(pos.ok_or(BacktestError::OrderNotFound)?);
-                // if queue.len() == 0 {
-                //     self.ask_queue.remove(&order_price_tick);
-                // }
-                Ok(())
+                unreachable!()
             }
             Side::None | Side::Unsupported => unreachable!(),
         }
@@ -792,13 +785,26 @@ where
             Side::Buy => {
                 let queue = self.bid_queue.get_mut(order_price_tick).unwrap();
                 let mut processed = false;
-                let mut pos = None;
-                for (i, order_in_q) in queue.iter_mut().enumerate() {
+                for i in 0..queue.len() {
+                    let order_in_q = queue.get_mut(i).unwrap();
                     if order_in_q.is_backtest_order() && order_in_q.order_id == order_id {
                         if (order_in_q.price_tick != order.price_tick)
                             || (order_in_q.leaves_qty < order.leaves_qty)
                         {
-                            pos = Some(i);
+                            let mut prev_order = queue.remove(i).unwrap();
+                            let prev_order_price_tick = prev_order.price_tick;
+                            prev_order.update(&order);
+                            // if queue.len() == 0 {
+                            //     self.bid_queue.remove(&order_price_tick);
+                            // }
+                            if prev_order_price_tick != order.price_tick {
+                                *order_price_tick = order.price_tick;
+                                let queue_ =
+                                    self.bid_queue.entry(prev_order.price_tick).or_default();
+                                queue_.push_back(prev_order);
+                            } else {
+                                queue.push_back(prev_order);
+                            }
                         } else {
                             order_in_q.leaves_qty = order.leaves_qty;
                             order_in_q.qty = order.qty;
@@ -808,37 +814,33 @@ where
                         break;
                     }
                 }
-
                 if !processed {
                     return Err(BacktestError::OrderNotFound);
-                }
-
-                if let Some(pos) = pos {
-                    let mut prev_order = queue.remove(pos);
-                    let prev_order_price_tick = prev_order.price_tick;
-                    prev_order.update(&order);
-                    // if queue.len() == 0 {
-                    //     self.bid_queue.remove(&order_price_tick);
-                    // }
-                    if prev_order_price_tick != order.price_tick {
-                        *order_price_tick = order.price_tick;
-                        let queue_ = self.bid_queue.entry(prev_order.price_tick).or_default();
-                        queue_.push(prev_order);
-                    } else {
-                        queue.push(prev_order);
-                    }
                 }
             }
             Side::Sell => {
                 let queue = self.ask_queue.get_mut(order_price_tick).unwrap();
                 let mut processed = false;
-                let mut pos = None;
-                for (i, order_in_q) in queue.iter_mut().enumerate() {
+                for i in 0..queue.len() {
+                    let order_in_q = queue.get_mut(i).unwrap();
                     if order_in_q.is_backtest_order() && order_in_q.order_id == order_id {
                         if (order_in_q.price_tick != order.price_tick)
                             || (order_in_q.leaves_qty < order.leaves_qty)
                         {
-                            pos = Some(i);
+                            let mut prev_order = queue.remove(i).unwrap();
+                            let prev_order_price_tick = prev_order.price_tick;
+                            prev_order.update(&order);
+                            // if queue.len() == 0 {
+                            //     self.bid_queue.remove(&order_price_tick);
+                            // }
+                            if prev_order_price_tick != order.price_tick {
+                                *order_price_tick = order.price_tick;
+                                let queue_ =
+                                    self.ask_queue.entry(prev_order.price_tick).or_default();
+                                queue_.push_back(prev_order);
+                            } else {
+                                queue.push_back(prev_order);
+                            }
                         } else {
                             order_in_q.leaves_qty = order.leaves_qty;
                             order_in_q.qty = order.qty;
@@ -848,25 +850,8 @@ where
                         break;
                     }
                 }
-
                 if !processed {
                     return Err(BacktestError::OrderNotFound);
-                }
-
-                if let Some(pos) = pos {
-                    let mut prev_order = queue.remove(pos);
-                    let prev_order_price_tick = prev_order.price_tick;
-                    prev_order.update(&order);
-                    // if queue.len() == 0 {
-                    //     self.bid_queue.remove(&order_price_tick);
-                    // }
-                    if prev_order_price_tick != order.price_tick {
-                        *order_price_tick = order.price_tick;
-                        let queue_ = self.ask_queue.entry(prev_order.price_tick).or_default();
-                        queue_.push(prev_order);
-                    } else {
-                        queue.push(prev_order);
-                    }
                 }
             }
             Side::None | Side::Unsupported => unreachable!(),
@@ -885,18 +870,35 @@ where
             .mkt_feed_orders
             .get_mut(&order_id)
             .ok_or(BacktestError::OrderNotFound)?;
+        let new_price_tick = (order.px / depth.tick_size()).round() as i64;
 
         match side {
             Side::Buy => {
                 let queue = self.bid_queue.get_mut(order_price_tick).unwrap();
                 let mut processed = false;
-                let mut pos = None;
-                for (i, order_in_q) in queue.iter_mut().enumerate() {
+                for i in 0..queue.len() {
+                    let order_in_q = queue.get_mut(i).unwrap();
                     if order_in_q.is_market_feed_order() && order_in_q.order_id == order_id {
-                        if (order_in_q.price_tick != *order_price_tick)
+                        if (order_in_q.price_tick != new_price_tick)
                             || (order_in_q.leaves_qty < order.qty)
                         {
-                            pos = Some(i);
+                            let mut prev_order = queue.remove(i).unwrap();
+                            let prev_order_price_tick = prev_order.price_tick;
+                            prev_order.price_tick = new_price_tick;
+                            prev_order.leaves_qty = order.qty;
+                            prev_order.qty = order.qty;
+                            prev_order.exch_timestamp = order.exch_ts;
+                            // if queue.len() == 0 {
+                            //     self.bid_queue.remove(&order_price_tick);
+                            // }
+                            if prev_order_price_tick != new_price_tick {
+                                *order_price_tick = new_price_tick;
+
+                                let queue_ = self.bid_queue.entry(*order_price_tick).or_default();
+                                queue_.push_back(prev_order);
+                            } else {
+                                queue.push_back(prev_order);
+                            }
                         } else {
                             order_in_q.leaves_qty = order.qty;
                             order_in_q.qty = order.qty;
@@ -906,39 +908,36 @@ where
                         break;
                     }
                 }
-
                 if !processed {
                     return Err(BacktestError::OrderNotFound);
-                }
-
-                if let Some(pos) = pos {
-                    let mut prev_order = queue.remove(pos);
-                    let prev_order_price_tick = prev_order.price_tick;
-                    prev_order.price_tick = (order.px / depth.tick_size()).round() as i64;
-                    prev_order.leaves_qty = order.qty;
-                    prev_order.qty = order.qty;
-                    prev_order.exch_timestamp = order.exch_ts;
-                    // if queue.len() == 0 {
-                    //     self.bid_queue.remove(&order_price_tick);
-                    // }
-                    if prev_order_price_tick != *order_price_tick {
-                        let queue_ = self.bid_queue.entry(*order_price_tick).or_default();
-                        queue_.push(prev_order);
-                    } else {
-                        queue.push(prev_order);
-                    }
                 }
             }
             Side::Sell => {
                 let queue = self.ask_queue.get_mut(order_price_tick).unwrap();
                 let mut processed = false;
-                let mut pos = None;
-                for (i, order_in_q) in queue.iter_mut().enumerate() {
+                for i in 0..queue.len() {
+                    let order_in_q = queue.get_mut(i).unwrap();
                     if order_in_q.is_market_feed_order() && order_in_q.order_id == order_id {
-                        if (order_in_q.price_tick != *order_price_tick)
+                        if (order_in_q.price_tick != new_price_tick)
                             || (order_in_q.leaves_qty < order.qty)
                         {
-                            pos = Some(i);
+                            let mut prev_order = queue.remove(i).unwrap();
+                            let prev_order_price_tick = prev_order.price_tick;
+                            prev_order.price_tick = new_price_tick;
+                            prev_order.leaves_qty = order.qty;
+                            prev_order.qty = order.qty;
+                            prev_order.exch_timestamp = order.exch_ts;
+                            // if queue.len() == 0 {
+                            //     self.bid_queue.remove(&order_price_tick);
+                            // }
+                            if prev_order_price_tick != new_price_tick {
+                                *order_price_tick = new_price_tick;
+
+                                let queue_ = self.ask_queue.entry(*order_price_tick).or_default();
+                                queue_.push_back(prev_order);
+                            } else {
+                                queue.push_back(prev_order);
+                            }
                         } else {
                             order_in_q.leaves_qty = order.qty;
                             order_in_q.qty = order.qty;
@@ -948,27 +947,8 @@ where
                         break;
                     }
                 }
-
                 if !processed {
                     return Err(BacktestError::OrderNotFound);
-                }
-
-                if let Some(pos) = pos {
-                    let mut prev_order = queue.remove(pos);
-                    let prev_order_price_tick = prev_order.price_tick;
-                    prev_order.price_tick = (order.px / depth.tick_size()).round() as i64;
-                    prev_order.leaves_qty = order.qty;
-                    prev_order.qty = order.qty;
-                    prev_order.exch_timestamp = order.exch_ts;
-                    // if queue.len() == 0 {
-                    //     self.bid_queue.remove(&order_price_tick);
-                    // }
-                    if prev_order_price_tick != *order_price_tick {
-                        let queue_ = self.ask_queue.entry(*order_price_tick).or_default();
-                        queue_.push(prev_order);
-                    } else {
-                        queue.push(prev_order);
-                    }
                 }
             }
             Side::None | Side::Unsupported => unreachable!(),
@@ -980,6 +960,7 @@ where
     fn fill_market_feed_order<const DELETE: bool>(
         &mut self,
         order_id: OrderId,
+        order: &Event,
         depth: &MD,
     ) -> Result<Vec<Order>, BacktestError> {
         let (side, order_price_tick) = if DELETE {
@@ -992,6 +973,7 @@ where
                 .get(&order_id)
                 .ok_or(BacktestError::OrderNotFound)?
         };
+        let exec_price_tick = (order.px / depth.tick_size()).round() as i64;
 
         match side {
             Side::Buy => {
@@ -1001,9 +983,9 @@ where
                 // filled.
                 // The fill event should occur before the cancel event which may update the best
                 // price.
-                if order_price_tick < depth.best_bid_tick() {
+                if exec_price_tick < depth.best_bid_tick() {
                     let mut f =
-                        self.fill_bid_between::<false>(depth.best_bid_tick(), order_price_tick + 1);
+                        self.fill_bid_between::<false>(depth.best_bid_tick(), exec_price_tick + 1);
                     filled.append(&mut f);
                 }
 
@@ -1011,32 +993,26 @@ where
                 // order, are filled.
                 let queue = self.bid_queue.get_mut(&order_price_tick).unwrap();
 
-                let mut pos = None;
                 let mut i = 0;
                 while i < queue.len() {
                     let order_in_q = queue.get(i).unwrap();
                     match order_in_q.order_source() {
                         L3OrderSource::MarketFeed if order_in_q.order_id == order_id => {
-                            pos = Some(i);
+                            if DELETE {
+                                queue.remove(i);
+                            }
                             break;
                         }
                         L3OrderSource::MarketFeed => {
                             i += 1;
                         }
                         L3OrderSource::Backtest => {
-                            let order = queue.remove(i);
+                            let order = queue.remove(i).unwrap();
                             filled.push(order);
                         }
                     }
                 }
-                let pos = pos.ok_or(BacktestError::OrderNotFound)?;
-                if DELETE {
-                    queue.remove(pos);
-                    // if queue.len() == 0 {
-                    //     self.ask_queue.remove(&order_price_tick);
-                    // }
-                }
-                for order in filled.iter() {
+                for order in &filled {
                     self.backtest_orders.remove(&order.order_id);
                 }
                 Ok(filled)
@@ -1048,9 +1024,9 @@ where
                 // filled.
                 // The fill event should occur before the cancel event which may update the best
                 // price.
-                if order_price_tick > depth.best_ask_tick() {
+                if exec_price_tick > depth.best_ask_tick() {
                     let mut f =
-                        self.fill_ask_between::<false>(depth.best_ask_tick(), order_price_tick - 1);
+                        self.fill_ask_between::<false>(depth.best_ask_tick(), exec_price_tick - 1);
                     filled.append(&mut f);
                 }
 
@@ -1058,32 +1034,26 @@ where
                 // order, are filled.
                 let queue = self.ask_queue.get_mut(&order_price_tick).unwrap();
 
-                let mut pos = None;
                 let mut i = 0;
                 while i < queue.len() {
                     let order_in_q = queue.get(i).unwrap();
                     match order_in_q.order_source() {
                         L3OrderSource::MarketFeed if order_in_q.order_id == order_id => {
-                            pos = Some(i);
+                            if DELETE {
+                                queue.remove(i);
+                            }
                             break;
                         }
                         L3OrderSource::MarketFeed => {
                             i += 1;
                         }
                         L3OrderSource::Backtest => {
-                            let order = queue.remove(i);
+                            let order = queue.remove(i).unwrap();
                             filled.push(order);
                         }
                     }
                 }
-                let pos = pos.ok_or(BacktestError::OrderNotFound)?;
-                if DELETE {
-                    queue.remove(pos);
-                    // if queue.len() == 0 {
-                    //     self.ask_queue.remove(&order_price_tick);
-                    // }
-                }
-                for order in filled.iter() {
+                for order in &filled {
                     self.backtest_orders.remove(&order.order_id);
                 }
                 Ok(filled)
@@ -1144,5 +1114,243 @@ where
                 unreachable!()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod l3_tests {
+    use crate::{
+        backtest::{models::L3FIFOQueueModel, L3QueueModel},
+        prelude::{
+            Event,
+            HashMapMarketDepth,
+            L3MarketDepth,
+            OrdType,
+            Order,
+            Side,
+            Status,
+            TimeInForce,
+        },
+        types::{ADD_ORDER_EVENT, BUY_EVENT, EXCH_EVENT, FILL_EVENT, SELL_EVENT},
+    };
+
+    #[test]
+    fn fill_by_crossing() {
+        let mut depth = HashMapMarketDepth::new(1.0, 1.0);
+        let mut qm = L3FIFOQueueModel::new();
+
+        let ev = Event {
+            ev: EXCH_EVENT | BUY_EVENT | ADD_ORDER_EVENT,
+            exch_ts: 0,
+            local_ts: 0,
+            px: 100.0,
+            qty: 1.0,
+            order_id: 1,
+            ival: 0,
+            fval: 0.0,
+        };
+
+        depth
+            .add_buy_order(ev.order_id, ev.px, ev.qty, ev.exch_ts)
+            .unwrap();
+        qm.add_market_feed_order(&ev, &depth).unwrap();
+
+        let ev = Event {
+            ev: EXCH_EVENT | SELL_EVENT | ADD_ORDER_EVENT,
+            exch_ts: 0,
+            local_ts: 0,
+            px: 101.0,
+            qty: 1.0,
+            order_id: 2,
+            ival: 0,
+            fval: 0.0,
+        };
+
+        depth
+            .add_sell_order(ev.order_id, ev.px, ev.qty, ev.exch_ts)
+            .unwrap();
+        qm.add_market_feed_order(&ev, &depth).unwrap();
+
+        qm.add_backtest_order(
+            Order {
+                qty: 1.0,
+                leaves_qty: 0.0,
+                exec_qty: 0.0,
+                exec_price_tick: 0,
+                price_tick: 100,
+                tick_size: 1.0,
+                exch_timestamp: 0,
+                local_timestamp: 0,
+                order_id: 1,
+                q: Box::new(()),
+                maker: false,
+                order_type: OrdType::Limit,
+                req: Status::None,
+                status: Status::None,
+                side: Side::Buy,
+                time_in_force: TimeInForce::GTC,
+            },
+            &depth,
+        )
+        .unwrap();
+
+        let filled = <L3FIFOQueueModel as L3QueueModel<HashMapMarketDepth>>::on_best_ask_update(
+            &mut qm, 101, 100,
+        )
+        .unwrap();
+        assert_eq!(filled.len(), 1);
+        assert!(
+            !<L3FIFOQueueModel as L3QueueModel<HashMapMarketDepth>>::contains_backtest_order(
+                &qm, 1
+            )
+        );
+
+        qm.add_backtest_order(
+            Order {
+                qty: 1.0,
+                leaves_qty: 0.0,
+                exec_qty: 0.0,
+                exec_price_tick: 0,
+                price_tick: 101,
+                tick_size: 1.0,
+                exch_timestamp: 0,
+                local_timestamp: 0,
+                order_id: 1,
+                q: Box::new(()),
+                maker: false,
+                order_type: OrdType::Limit,
+                req: Status::None,
+                status: Status::None,
+                side: Side::Sell,
+                time_in_force: TimeInForce::GTC,
+            },
+            &depth,
+        )
+        .unwrap();
+
+        let filled = <L3FIFOQueueModel as L3QueueModel<HashMapMarketDepth>>::on_best_bid_update(
+            &mut qm, 100, 101,
+        )
+        .unwrap();
+        assert_eq!(filled.len(), 1);
+        assert!(
+            !<L3FIFOQueueModel as L3QueueModel<HashMapMarketDepth>>::contains_backtest_order(
+                &qm, 1
+            )
+        );
+    }
+
+    #[test]
+    fn fill_in_queue() {
+        let mut depth = HashMapMarketDepth::new(1.0, 1.0);
+        let mut qm = L3FIFOQueueModel::new();
+
+        let ev = Event {
+            ev: EXCH_EVENT | BUY_EVENT | ADD_ORDER_EVENT,
+            exch_ts: 0,
+            local_ts: 0,
+            px: 100.0,
+            qty: 1.0,
+            order_id: 1,
+            ival: 0,
+            fval: 0.0,
+        };
+
+        depth
+            .add_buy_order(ev.order_id, ev.px, ev.qty, ev.exch_ts)
+            .unwrap();
+        qm.add_market_feed_order(&ev, &depth).unwrap();
+
+        qm.add_backtest_order(
+            Order {
+                qty: 1.0,
+                leaves_qty: 0.0,
+                exec_qty: 0.0,
+                exec_price_tick: 0,
+                price_tick: 100,
+                tick_size: 1.0,
+                exch_timestamp: 0,
+                local_timestamp: 0,
+                order_id: 1,
+                q: Box::new(()),
+                maker: false,
+                order_type: OrdType::Limit,
+                req: Status::None,
+                status: Status::None,
+                side: Side::Buy,
+                time_in_force: TimeInForce::GTC,
+            },
+            &depth,
+        )
+        .unwrap();
+
+        let ev = Event {
+            ev: EXCH_EVENT | BUY_EVENT | ADD_ORDER_EVENT,
+            exch_ts: 0,
+            local_ts: 0,
+            px: 100.0,
+            qty: 1.0,
+            order_id: 2,
+            ival: 0,
+            fval: 0.0,
+        };
+
+        depth
+            .add_buy_order(ev.order_id, ev.px, ev.qty, ev.exch_ts)
+            .unwrap();
+        qm.add_market_feed_order(&ev, &depth).unwrap();
+
+        let ev = Event {
+            ev: EXCH_EVENT | BUY_EVENT | ADD_ORDER_EVENT,
+            exch_ts: 0,
+            local_ts: 0,
+            px: 100.0,
+            qty: 1.0,
+            order_id: 3,
+            ival: 0,
+            fval: 0.0,
+        };
+
+        depth
+            .add_buy_order(ev.order_id, ev.px, ev.qty, ev.exch_ts)
+            .unwrap();
+        qm.add_market_feed_order(&ev, &depth).unwrap();
+
+        depth.delete_order(1, 0).unwrap();
+        //qm.cancel_market_feed_order(1, &depth).unwrap();
+
+        let ev = Event {
+            ev: EXCH_EVENT | BUY_EVENT | FILL_EVENT,
+            exch_ts: 0,
+            local_ts: 0,
+            px: 100.0,
+            qty: 1.0,
+            order_id: 1,
+            ival: 0,
+            fval: 0.0,
+        };
+
+        let filled = qm.fill_market_feed_order::<false>(1, &ev, &depth).unwrap();
+        assert_eq!(filled.len(), 0);
+
+        let ev = Event {
+            ev: EXCH_EVENT | BUY_EVENT | FILL_EVENT,
+            exch_ts: 0,
+            local_ts: 0,
+            px: 100.0,
+            qty: 1.0,
+            order_id: 2,
+            ival: 0,
+            fval: 0.0,
+        };
+
+        depth.delete_order(2, 0).unwrap();
+        let filled = qm.fill_market_feed_order::<false>(2, &ev, &depth).unwrap();
+        assert_eq!(filled.len(), 1);
+        assert!(
+            !<L3FIFOQueueModel as L3QueueModel<HashMapMarketDepth>>::contains_backtest_order(
+                &qm, 1
+            )
+        );
     }
 }

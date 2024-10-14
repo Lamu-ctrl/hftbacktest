@@ -39,9 +39,9 @@ def generate_order_latency_nb(data, order_latency, mul_entry, offset_entry, mul_
         order_exch_ts = req_ts + order_entry_latency
         resp_ts = order_exch_ts + order_resp_latency
 
-        order_latency[i].req_timestamp = req_ts
-        order_latency[i].exch_timestamp = order_exch_ts
-        order_latency[i].resp_timestamp = resp_ts
+        order_latency[i].req_ts = req_ts
+        order_latency[i].exch_ts = order_exch_ts
+        order_latency[i].resp_ts = resp_ts
 
 
 def generate_order_latency(feed_file, output_file=None, mul_entry=1, offset_entry=0, mul_resp=1, offset_resp=0):
@@ -55,10 +55,10 @@ def generate_order_latency(feed_file, output_file=None, mul_entry=1, offset_entr
     order_latency = np.zeros(
         len(data),
         dtype=[
-            ('req_timestamp', '<i8'),
-            ('exch_timestamp', '<i8'),
-            ('resp_timestamp', '<i8'),
-            ('_reserved', '<i8')
+            ('req_ts', '<i8'),
+            ('exch_ts', '<i8'),
+            ('resp_ts', '<i8'),
+            ('_padding', '<i8')
         ]
     )
     generate_order_latency_nb(data, order_latency, mul_entry, offset_entry, mul_resp, offset_resp)

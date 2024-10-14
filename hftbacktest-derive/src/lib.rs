@@ -1,6 +1,6 @@
 extern crate proc_macro;
 use proc_macro::TokenStream;
-use proc_macro2::Ident;
+use proc_macro2::{Ident, Span};
 use quote::quote;
 use syn::{
     self,
@@ -207,9 +207,10 @@ pub fn build_asset(input: TokenStream) -> TokenStream {
                         let fm_args = &fee_model.args;
 
                         let prob_func_ident =
-                            Ident::new(&format!("{}Func", qm_ident), qm_ident.span());
+                            Ident::new(&format!("{}Func", qm_ident), Span::call_site());
 
-                        let qm_construct = if qm_ident.to_string().contains("ProbQueueModel") {
+                        let qm_ident_str = qm_ident.to_string();
+                        let qm_construct = if qm_ident_str.contains("ProbQueueModel") {
                             quote! {
                                 ProbQueueModel::<#prob_func_ident, #marketdepth>::new(#prob_func_ident::new(#(#qm_args.clone()),*));
                             }
@@ -217,6 +218,18 @@ pub fn build_asset(input: TokenStream) -> TokenStream {
                             quote! {
                                 #qm_ident::new();
                             }
+                        };
+
+                        let l3 = qm_ident_str == "L3FIFOQueueModel";
+                        let (local_ident, exch_ident) = if l3 {
+                            // todo: L3PartialFillExchange is unsupported. This is verified within
+                            //  the build functions in the py-hftbacktest module.
+                            (
+                                Ident::new("L3Local", Span::call_site()),
+                                Ident::new("L3NoPartialFillExchange", Span::call_site()),
+                            )
+                        } else {
+                            (Ident::new("Local", Span::call_site()), em_ident.clone())
                         };
 
                         let depth_construct = match marketdepth.to_string().as_str() {
@@ -246,19 +259,20 @@ pub fn build_asset(input: TokenStream) -> TokenStream {
                             ExchangeKind::#em_ident { #(#em_args),* },
                             FeeModel::#fm_ident { #(#fm_args),* },
                         ) => {
-                            let cache = Cache::new();
-                            let mut reader = Reader::new(cache);
-
-                            for data in #asset.data.iter() {
-                                match data {
-                                    DataSource::File(file) => {
-                                        reader.add_file(file.to_string());
-                                    }
-                                    DataSource::Data(data) => {
-                                        reader.add_data(data.clone());
-                                    }
-                                }
-                            }
+                            let reader = if #asset.latency_offset == 0 {
+                                Reader::builder()
+                                    .parallel_load(#asset.parallel_load)
+                                    .data(#asset.data.clone())
+                                    .build()
+                                    .unwrap()
+                            } else {
+                                Reader::builder()
+                                    .parallel_load(#asset.parallel_load)
+                                    .data(#asset.data.clone())
+                                    .preprocessor(FeedLatencyAdjustment::new(#asset.latency_offset))
+                                    .build()
+                                    .unwrap()
+                            };
 
                             let ob_local_to_exch = OrderBus::new();
                             let ob_exch_to_local = OrderBus::new();
@@ -279,7 +293,7 @@ pub fn build_asset(input: TokenStream) -> TokenStream {
                                 None => {}
                             }
 
-                            let local: Box<dyn LocalProcessor<#marketdepth, Event>> = Box::new(Local::new(
+                            let local: Box<dyn LocalProcessor<#marketdepth>> = Box::new(#local_ident::new(
                                 reader.clone(),
                                 market_depth,
                                 State::new(asset_type.clone(), fee_model.clone()),
@@ -303,7 +317,7 @@ pub fn build_asset(input: TokenStream) -> TokenStream {
 
                             let queue_model = #qm_construct;
 
-                            let exch: Box<dyn Processor> = Box::new(#em_ident::new(
+                            let exch: Box<dyn Processor> = Box::new(#exch_ident::new(
                                 reader,
                                 market_depth,
                                 State::new(asset_type, fee_model.clone()),

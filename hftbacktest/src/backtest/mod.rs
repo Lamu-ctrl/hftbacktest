@@ -1,11 +1,10 @@
 use std::{collections::HashMap, io::Error as IoError, marker::PhantomData};
 
 pub use data::DataSource;
-use data::{Cache, Reader};
+use data::Reader;
 use models::FeeModel;
 use thiserror::Error;
 
-#[cfg(feature = "unstable_l3")]
 pub use crate::backtest::{
     models::L3QueueModel,
     proc::{L3Local, L3NoPartialFillExchange},
@@ -13,6 +12,7 @@ pub use crate::backtest::{
 use crate::{
     backtest::{
         assettype::AssetType,
+        data::FeedLatencyAdjustment,
         evs::{EventIntentKind, EventSet},
         models::{LatencyModel, QueueModel},
         order::OrderBus,
@@ -90,8 +90,8 @@ impl<L, E> Asset<L, E> {
         }
     }
 
-    /// Returns a builder for `Asset`.
-    pub fn builder<Q, LM, AT, QM, MD, FM>() -> AssetBuilder<LM, AT, QM, MD, FM>
+    /// Returns an `L2AssetBuilder`.
+    pub fn l2_builder<LM, AT, QM, MD, FM>() -> L2AssetBuilder<LM, AT, QM, MD, FM>
     where
         AT: AssetType + Clone + 'static,
         MD: MarketDepth + L2MarketDepth + 'static,
@@ -99,7 +99,20 @@ impl<L, E> Asset<L, E> {
         LM: LatencyModel + Clone + 'static,
         FM: FeeModel + Clone + 'static,
     {
-        AssetBuilder::new()
+        L2AssetBuilder::new()
+    }
+
+    /// Returns an `L3AssetBuilder`.
+    pub fn l3_builder<LM, AT, QM, MD, FM>() -> L3AssetBuilder<LM, AT, QM, MD, FM>
+    where
+        AT: AssetType + Clone + 'static,
+        MD: MarketDepth + L3MarketDepth + 'static,
+        QM: L3QueueModel<MD> + 'static,
+        LM: LatencyModel + Clone + 'static,
+        FM: FeeModel + Clone + 'static,
+        BacktestError: From<<MD as L3MarketDepth>::Error>,
+    {
+        L3AssetBuilder::new()
     }
 }
 
@@ -111,19 +124,21 @@ pub enum ExchangeKind {
     PartialFillExchange,
 }
 
-/// A builder for `Asset`.
-pub struct AssetBuilder<LM, AT, QM, MD, FM> {
+/// A level-2 asset builder.
+pub struct L2AssetBuilder<LM, AT, QM, MD, FM> {
     latency_model: Option<LM>,
     asset_type: Option<AT>,
-    queue_model: Option<QM>,
-    depth_builder: Option<Box<dyn Fn() -> MD>>,
-    reader: Reader<Event>,
+    data: Vec<DataSource<Event>>,
+    parallel_load: bool,
+    latency_offset: i64,
     fee_model: Option<FM>,
     exch_kind: ExchangeKind,
     last_trades_cap: usize,
+    queue_model: Option<QM>,
+    depth_builder: Option<Box<dyn Fn() -> MD>>,
 }
 
-impl<LM, AT, QM, MD, FM> AssetBuilder<LM, AT, QM, MD, FM>
+impl<LM, AT, QM, MD, FM> L2AssetBuilder<LM, AT, QM, MD, FM>
 where
     AT: AssetType + Clone + 'static,
     MD: MarketDepth + L2MarketDepth + 'static,
@@ -131,36 +146,45 @@ where
     LM: LatencyModel + Clone + 'static,
     FM: FeeModel + Clone + 'static,
 {
-    /// Constructs an instance of `AssetBuilder`.
+    /// Constructs an `L2AssetBuilder`.
     pub fn new() -> Self {
-        let cache = Cache::new();
-        let reader = Reader::new(cache);
-
         Self {
             latency_model: None,
             asset_type: None,
-            queue_model: None,
-            depth_builder: None,
-            reader,
+            data: vec![],
+            parallel_load: false,
+            latency_offset: 0,
             fee_model: None,
             exch_kind: ExchangeKind::NoPartialFillExchange,
             last_trades_cap: 0,
+            queue_model: None,
+            depth_builder: None,
         }
     }
 
     /// Sets the feed data.
-    pub fn data(mut self, data: Vec<DataSource<Event>>) -> Self {
-        for item in data {
-            match item {
-                DataSource::File(filename) => {
-                    self.reader.add_file(filename);
-                }
-                DataSource::Data(data) => {
-                    self.reader.add_data(data);
-                }
-            }
+    pub fn data(self, data: Vec<DataSource<Event>>) -> Self {
+        Self { data, ..self }
+    }
+
+    /// Sets whether to load the next data in parallel with backtesting. This can speed up the
+    /// backtest by reducing data loading time, but it also increases memory usage.
+    /// The default value is `true`.
+    pub fn parallel_load(self, parallel_load: bool) -> Self {
+        Self {
+            parallel_load,
+            ..self
         }
-        self
+    }
+
+    /// Sets the latency offset to adjust the feed latency by the specified amount. This is
+    /// particularly useful in cross-exchange backtesting, where the feed data is collected from a
+    /// different site than the one where the strategy is intended to run.
+    pub fn latency_offset(self, latency_offset: i64) -> Self {
+        Self {
+            latency_offset,
+            ..self
+        }
     }
 
     /// Sets a latency model.
@@ -179,29 +203,10 @@ where
         }
     }
 
-    /// Sets a queue model.
-    pub fn queue_model(self, queue_model: QM) -> Self {
-        Self {
-            queue_model: Some(queue_model),
-            ..self
-        }
-    }
-
     /// Sets a fee model.
     pub fn fee_model(self, fee_model: FM) -> Self {
         Self {
             fee_model: Some(fee_model),
-            ..self
-        }
-    }
-
-    /// Sets a market depth builder.
-    pub fn depth<Builder>(self, builder: Builder) -> Self
-    where
-        Builder: Fn() -> MD + 'static,
-    {
-        Self {
-            depth_builder: Some(Box::new(builder)),
             ..self
         }
     }
@@ -220,8 +225,42 @@ where
         }
     }
 
+    /// Sets a queue model.
+    pub fn queue_model(self, queue_model: QM) -> Self {
+        Self {
+            queue_model: Some(queue_model),
+            ..self
+        }
+    }
+
+    /// Sets a market depth builder.
+    pub fn depth<Builder>(self, builder: Builder) -> Self
+    where
+        Builder: Fn() -> MD + 'static,
+    {
+        Self {
+            depth_builder: Some(Box::new(builder)),
+            ..self
+        }
+    }
+
     /// Builds an `Asset`.
-    pub fn build(self) -> Result<Asset<dyn LocalProcessor<MD, Event>, dyn Processor>, BuildError> {
+    pub fn build(self) -> Result<Asset<dyn LocalProcessor<MD>, dyn Processor>, BuildError> {
+        let reader = if self.latency_offset == 0 {
+            Reader::builder()
+                .parallel_load(self.parallel_load)
+                .data(self.data)
+                .build()
+                .map_err(|err| BuildError::Error(err.into()))?
+        } else {
+            Reader::builder()
+                .parallel_load(self.parallel_load)
+                .data(self.data)
+                .preprocessor(FeedLatencyAdjustment::new(self.latency_offset))
+                .build()
+                .map_err(|err| BuildError::Error(err.into()))?
+        };
+
         let ob_local_to_exch = OrderBus::new();
         let ob_exch_to_local = OrderBus::new();
 
@@ -243,7 +282,7 @@ where
             .ok_or(BuildError::BuilderIncomplete("fee_model"))?;
 
         let local = Local::new(
-            self.reader.clone(),
+            reader.clone(),
             create_depth(),
             State::new(asset_type, fee_model),
             order_latency,
@@ -271,7 +310,7 @@ where
         match self.exch_kind {
             ExchangeKind::NoPartialFillExchange => {
                 let exch = NoPartialFillExchange::new(
-                    self.reader.clone(),
+                    reader.clone(),
                     create_depth(),
                     State::new(asset_type, fee_model),
                     order_latency,
@@ -287,7 +326,7 @@ where
             }
             ExchangeKind::PartialFillExchange => {
                 let exch = PartialFillExchange::new(
-                    self.reader.clone(),
+                    reader.clone(),
                     create_depth(),
                     State::new(asset_type, fee_model),
                     order_latency,
@@ -303,76 +342,9 @@ where
             }
         }
     }
-
-    /// Builds an asset for multi-asset single-exchange backtest, which may be slightly faster than
-    /// a multi-asset multi-exchange backtest.
-    pub fn build_single(
-        self,
-    ) -> Result<Asset<Local<AT, LM, MD, FM>, NoPartialFillExchange<AT, LM, QM, MD, FM>>, BuildError>
-    {
-        let ob_local_to_exch = OrderBus::new();
-        let ob_exch_to_local = OrderBus::new();
-
-        let create_depth = self
-            .depth_builder
-            .as_ref()
-            .ok_or(BuildError::BuilderIncomplete("depth"))?;
-        let order_latency = self
-            .latency_model
-            .clone()
-            .ok_or(BuildError::BuilderIncomplete("order_latency"))?;
-        let asset_type = self
-            .asset_type
-            .clone()
-            .ok_or(BuildError::BuilderIncomplete("asset_type"))?;
-        let fee_model = self
-            .fee_model
-            .clone()
-            .ok_or(BuildError::BuilderIncomplete("fee_model"))?;
-
-        let local = Local::new(
-            self.reader.clone(),
-            create_depth(),
-            State::new(asset_type, fee_model),
-            order_latency,
-            self.last_trades_cap,
-            ob_local_to_exch.clone(),
-            ob_exch_to_local.clone(),
-        );
-
-        let order_latency = self
-            .latency_model
-            .clone()
-            .ok_or(BuildError::BuilderIncomplete("order_latency"))?;
-        let queue_model = self
-            .queue_model
-            .ok_or(BuildError::BuilderIncomplete("queue_model"))?;
-        let asset_type = self
-            .asset_type
-            .clone()
-            .ok_or(BuildError::BuilderIncomplete("asset_type"))?;
-        let fee_model = self
-            .fee_model
-            .clone()
-            .ok_or(BuildError::BuilderIncomplete("fee_model"))?;
-        let exch = NoPartialFillExchange::new(
-            self.reader.clone(),
-            create_depth(),
-            State::new(asset_type, fee_model),
-            order_latency,
-            queue_model,
-            ob_exch_to_local,
-            ob_local_to_exch,
-        );
-
-        Ok(Asset {
-            local: Box::new(local),
-            exch: Box::new(exch),
-        })
-    }
 }
 
-impl<LM, AT, QM, MD, FM> Default for AssetBuilder<LM, AT, QM, MD, FM>
+impl<LM, AT, QM, MD, FM> Default for L2AssetBuilder<LM, AT, QM, MD, FM>
 where
     AT: AssetType + Clone + 'static,
     MD: MarketDepth + L2MarketDepth + 'static,
@@ -385,35 +357,20 @@ where
     }
 }
 
-/// A builder for `Asset`.
-#[cfg(feature = "unstable_l3")]
+/// A level-3 asset builder.
 pub struct L3AssetBuilder<LM, AT, QM, MD, FM> {
     latency_model: Option<LM>,
     asset_type: Option<AT>,
-    queue_model: Option<QM>,
-    depth_builder: Option<Box<dyn Fn() -> MD>>,
-    reader: Reader<Event>,
+    data: Vec<DataSource<Event>>,
+    parallel_load: bool,
+    latency_offset: i64,
     fee_model: Option<FM>,
     exch_kind: ExchangeKind,
     last_trades_cap: usize,
+    queue_model: Option<QM>,
+    depth_builder: Option<Box<dyn Fn() -> MD>>,
 }
 
-#[cfg(feature = "unstable_l3")]
-impl<LM, AT, QM, MD, FM> Default for L3AssetBuilder<LM, AT, QM, MD, FM>
-where
-    AT: AssetType + Clone + 'static,
-    MD: MarketDepth + L3MarketDepth + 'static,
-    QM: L3QueueModel<MD> + 'static,
-    LM: LatencyModel + Clone + 'static,
-    FM: FeeModel + Clone + 'static,
-    BacktestError: From<<MD as L3MarketDepth>::Error>,
-{
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(feature = "unstable_l3")]
 impl<LM, AT, QM, MD, FM> L3AssetBuilder<LM, AT, QM, MD, FM>
 where
     AT: AssetType + Clone + 'static,
@@ -423,36 +380,45 @@ where
     FM: FeeModel + Clone + 'static,
     BacktestError: From<<MD as L3MarketDepth>::Error>,
 {
-    /// Constructs an instance of `AssetBuilder`.
+    /// Constructs an `L3AssetBuilder`.
     pub fn new() -> Self {
-        let cache = Cache::new();
-        let reader = Reader::new(cache);
-
         Self {
             latency_model: None,
             asset_type: None,
-            queue_model: None,
-            depth_builder: None,
-            reader,
+            data: vec![],
+            parallel_load: false,
+            latency_offset: 0,
             fee_model: None,
             exch_kind: ExchangeKind::NoPartialFillExchange,
             last_trades_cap: 0,
+            queue_model: None,
+            depth_builder: None,
         }
     }
 
     /// Sets the feed data.
-    pub fn data(mut self, data: Vec<DataSource<Event>>) -> Self {
-        for item in data {
-            match item {
-                DataSource::File(filename) => {
-                    self.reader.add_file(filename);
-                }
-                DataSource::Data(data) => {
-                    self.reader.add_data(data);
-                }
-            }
+    pub fn data(self, data: Vec<DataSource<Event>>) -> Self {
+        Self { data, ..self }
+    }
+
+    /// Sets whether to load the next data in parallel with backtesting. This can speed up the
+    /// backtest by reducing data loading time, but it also increases memory usage.
+    /// The default value is `true`.
+    pub fn parallel_load(self, parallel_load: bool) -> Self {
+        Self {
+            parallel_load,
+            ..self
         }
-        self
+    }
+
+    /// Sets the latency offset to adjust the feed latency by the specified amount. This is
+    /// particularly useful in cross-exchange backtesting, where the feed data is collected from a
+    /// different site than the one where the strategy is intended to run.
+    pub fn latency_offset(self, latency_offset: i64) -> Self {
+        Self {
+            latency_offset,
+            ..self
+        }
     }
 
     /// Sets a latency model.
@@ -471,29 +437,10 @@ where
         }
     }
 
-    /// Sets a queue model.
-    pub fn queue_model(self, queue_model: QM) -> Self {
-        Self {
-            queue_model: Some(queue_model),
-            ..self
-        }
-    }
-
     /// Sets a fee model.
     pub fn fee_model(self, fee_model: FM) -> Self {
         Self {
             fee_model: Some(fee_model),
-            ..self
-        }
-    }
-
-    /// Sets a market depth builder.
-    pub fn depth<Builder>(self, builder: Builder) -> Self
-    where
-        Builder: Fn() -> MD + 'static,
-    {
-        Self {
-            depth_builder: Some(Box::new(builder)),
             ..self
         }
     }
@@ -512,8 +459,42 @@ where
         }
     }
 
+    /// Sets a queue model.
+    pub fn queue_model(self, queue_model: QM) -> Self {
+        Self {
+            queue_model: Some(queue_model),
+            ..self
+        }
+    }
+
+    /// Sets a market depth builder.
+    pub fn depth<Builder>(self, builder: Builder) -> Self
+    where
+        Builder: Fn() -> MD + 'static,
+    {
+        Self {
+            depth_builder: Some(Box::new(builder)),
+            ..self
+        }
+    }
+
     /// Builds an `Asset`.
-    pub fn build(self) -> Result<Asset<dyn LocalProcessor<MD, Event>, dyn Processor>, BuildError> {
+    pub fn build(self) -> Result<Asset<dyn LocalProcessor<MD>, dyn Processor>, BuildError> {
+        let reader = if self.latency_offset == 0 {
+            Reader::builder()
+                .parallel_load(self.parallel_load)
+                .data(self.data)
+                .build()
+                .map_err(|err| BuildError::Error(err.into()))?
+        } else {
+            Reader::builder()
+                .parallel_load(self.parallel_load)
+                .data(self.data)
+                .preprocessor(FeedLatencyAdjustment::new(self.latency_offset))
+                .build()
+                .map_err(|err| BuildError::Error(err.into()))?
+        };
+
         let ob_local_to_exch = OrderBus::new();
         let ob_exch_to_local = OrderBus::new();
 
@@ -535,7 +516,7 @@ where
             .ok_or(BuildError::BuilderIncomplete("fee_model"))?;
 
         let local = L3Local::new(
-            self.reader.clone(),
+            reader.clone(),
             create_depth(),
             State::new(asset_type, fee_model),
             order_latency,
@@ -563,11 +544,11 @@ where
         match self.exch_kind {
             ExchangeKind::NoPartialFillExchange => {
                 let exch = L3NoPartialFillExchange::new(
-                    self.reader.clone(),
+                    reader.clone(),
                     create_depth(),
                     State::new(asset_type, fee_model),
-                    queue_model,
                     order_latency,
+                    queue_model,
                     ob_exch_to_local,
                     ob_local_to_exch,
                 );
@@ -578,21 +559,35 @@ where
                 })
             }
             ExchangeKind::PartialFillExchange => {
-                todo!()
+                unimplemented!();
             }
         }
     }
 }
 
+impl<LM, AT, QM, MD, FM> Default for L3AssetBuilder<LM, AT, QM, MD, FM>
+where
+    AT: AssetType + Clone + 'static,
+    MD: MarketDepth + L3MarketDepth + 'static,
+    QM: L3QueueModel<MD> + 'static,
+    LM: LatencyModel + Clone + 'static,
+    FM: FeeModel + Clone + 'static,
+    BacktestError: From<<MD as L3MarketDepth>::Error>,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// [`Backtest`] builder.
 pub struct BacktestBuilder<MD> {
-    local: Vec<Box<dyn LocalProcessor<MD, Event>>>,
+    local: Vec<Box<dyn LocalProcessor<MD>>>,
     exch: Vec<Box<dyn Processor>>,
 }
 
 impl<MD> BacktestBuilder<MD> {
     /// Adds [`Asset`], which will undergo simulation within the backtester.
-    pub fn add_asset(self, asset: Asset<dyn LocalProcessor<MD, Event>, dyn Processor>) -> Self {
+    pub fn add_asset(self, asset: Asset<dyn LocalProcessor<MD>, dyn Processor>) -> Self {
         let mut self_ = Self { ..self };
         self_.local.push(asset.local);
         self_.exch.push(asset.exch);
@@ -620,7 +615,7 @@ impl<MD> BacktestBuilder<MD> {
 pub struct Backtest<MD> {
     cur_ts: i64,
     evs: EventSet,
-    local: Vec<Box<dyn LocalProcessor<MD, Event>>>,
+    local: Vec<Box<dyn LocalProcessor<MD>>>,
     exch: Vec<Box<dyn Processor>>,
 }
 
@@ -635,10 +630,7 @@ where
         }
     }
 
-    pub fn new(
-        local: Vec<Box<dyn LocalProcessor<MD, Event>>>,
-        exch: Vec<Box<dyn Processor>>,
-    ) -> Self {
+    pub fn new(local: Vec<Box<dyn LocalProcessor<MD>>>, exch: Vec<Box<dyn Processor>>) -> Self {
         let num_assets = local.len();
         if local.len() != num_assets || exch.len() != num_assets {
             panic!();
@@ -1047,7 +1039,7 @@ pub struct MultiAssetSingleExchangeBacktestBuilder<Local, Exchange> {
 
 impl<Local, Exchange> MultiAssetSingleExchangeBacktestBuilder<Local, Exchange>
 where
-    Local: LocalProcessor<HashMapMarketDepth, Event> + 'static,
+    Local: LocalProcessor<HashMapMarketDepth> + 'static,
     Exchange: Processor + 'static,
 {
     /// Adds [`Asset`], which will undergo simulation within the backtester.
@@ -1092,7 +1084,7 @@ pub struct MultiAssetSingleExchangeBacktest<MD, Local, Exchange> {
 impl<MD, Local, Exchange> MultiAssetSingleExchangeBacktest<MD, Local, Exchange>
 where
     MD: MarketDepth,
-    Local: LocalProcessor<MD, Event>,
+    Local: LocalProcessor<MD>,
     Exchange: Processor,
 {
     pub fn builder() -> MultiAssetSingleExchangeBacktestBuilder<Local, Exchange> {
@@ -1237,7 +1229,7 @@ where
 impl<MD, Local, Exchange> Bot<MD> for MultiAssetSingleExchangeBacktest<MD, Local, Exchange>
 where
     MD: MarketDepth,
-    Local: LocalProcessor<MD, Event>,
+    Local: LocalProcessor<MD>,
     Exchange: Processor,
 {
     type Error = BacktestError;
