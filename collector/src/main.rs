@@ -10,6 +10,7 @@ mod binancefuturescm;
 mod binancefuturesum;
 mod bybit;
 mod bitcom;
+mod woo;
 mod error;
 mod file;
 mod throttler;
@@ -101,6 +102,19 @@ async fn main() -> Result<(), anyhow::Error> {
             .collect();
 
             tokio::spawn(bitcom::run_collection(topics, args.symbols, writer_tx))
+        }
+        "woo" =>{
+            let topics = vec![
+                "$symbol@orderbook",
+                "$symbol@orderbookupdate",
+                "$symbol@trade",
+                "$symbol@bbo",
+            ]
+            .iter()
+            .map(|topic| topic.to_string())
+            .collect();
+
+            tokio::spawn(woo::run_collection(topics, args.symbols, writer_tx))
         }
         exchange => {
             return Err(anyhow!("{exchange} is not supported."));
